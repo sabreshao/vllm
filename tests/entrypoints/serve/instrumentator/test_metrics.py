@@ -11,12 +11,16 @@ import openai
 import pytest
 import pytest_asyncio
 import requests
+from fastapi import FastAPI, Response
+from fastapi.testclient import TestClient
 from prometheus_client.parser import text_string_to_metric_families
+from starlette.routing import Match
 from transformers import AutoTokenizer
 
 from tests.conftest import LocalAssetServer
 from tests.utils import RemoteOpenAIServer
 from vllm import version
+from vllm.entrypoints.serve.instrumentator.metrics import attach_router
 from vllm.utils.network_utils import get_open_port
 
 MODELS = {
@@ -24,6 +28,33 @@ MODELS = {
     "multimodal": "HuggingFaceTB/SmolVLM-256M-Instruct",
 }
 PREV_MINOR_VERSION = version._prev_minor_version()
+
+
+class _PathlessRoute:
+    """Route-like object matching FastAPI route records without a path field."""
+
+    def matches(self, scope):
+        if scope["path"] == "/pathless":
+            return Match.FULL, {}
+        return Match.NONE, {}
+
+    async def handle(self, scope, receive, send):
+        response = Response("ok")
+        await response(scope, receive, send)
+
+
+def test_metrics_middleware_handles_pathless_routes():
+    app = FastAPI()
+    attach_router(app)
+    app.routes.append(_PathlessRoute())
+
+    with TestClient(app) as client:
+        response = client.get("/pathless")
+        assert response.status_code == HTTPStatus.OK
+        assert response.text == "ok"
+
+        metrics_response = client.get("/metrics")
+        assert metrics_response.status_code == HTTPStatus.OK
 
 
 @pytest.fixture(scope="module", params=list(MODELS.keys()))
