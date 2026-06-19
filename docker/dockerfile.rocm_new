@@ -16,7 +16,13 @@ ARG PYTORCH_AUDIO_BRANCH="v2.9.0"
 ARG PYTORCH_AUDIO_REPO="https://github.com/pytorch/audio.git"
 ARG FA_BRANCH="0e60e394"
 ARG FA_REPO="https://github.com/Dao-AILab/flash-attention.git"
-ARG AITER_BRANCH="v0.1.15"
+# Pin aiter to the ATOM-validated commit for DeepSeek-V4 MXFP4 MoE.
+# aiter v0.1.15 (0.1.15.post1) regressed the gfx950 MXFP4 fused-MoE kernels
+# (DeepSeek-V4 served garbage / GSM8K ~0.16); commit 971d98b8e (0.1.14rc1.dev318,
+# CK submodule af7118e34) is verified working (GSM8K 0.94 on the ATOM stack).
+# AITER_BRANCH may be a branch, tag, or commit SHA (see the build_aiter stage).
+# Newer working alternatives on the same CK submodule: ace71b5fa, 003858693.
+ARG AITER_BRANCH="971d98b8e"
 ARG AITER_REPO="https://github.com/ROCm/aiter.git"
 ARG MORI_BRANCH="v1.1.0"
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
@@ -242,8 +248,12 @@ ARG AITER_REPO
 ARG USE_SCCACHE
 RUN --mount=type=bind,from=build_pytorch,src=/app/install/,target=/install \
     pip install /install/*.whl
-RUN git clone --recursive --branch ${AITER_BRANCH} ${AITER_REPO}
+# Clone then checkout so AITER_BRANCH can be a branch, tag, OR commit SHA.
+RUN git clone ${AITER_REPO} aiter \
+    && cd aiter \
+    && git checkout ${AITER_BRANCH}
 RUN cd aiter \
+    && git submodule sync \
     && git submodule update --init --recursive \
     && pip install -r requirements.txt
 RUN pip install pyyaml && cd aiter \
