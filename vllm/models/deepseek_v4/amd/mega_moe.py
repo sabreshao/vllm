@@ -222,8 +222,12 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             self._runtime_cache[key] = runtime
         return runtime
 
-    def select_runtime(self, num_tokens: int) -> Any:
-        # Dispatch is collective, so every EP rank must pick the same runtime.
+    def select_runtime(self, num_tokens: int) -> tuple[Any, int]:
+        """Return the runtime and the token count every EP rank agrees on.
+
+        Dispatch is collective and AITER picks its kernel config from the token
+        count, so every EP rank must use the same runtime and config_tokens.
+        """
         if is_forward_context_available():
             dp_metadata = get_forward_context().dp_metadata
             if dp_metadata is not None:
@@ -232,7 +236,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 )
         for max_tok_per_rank, runtime in self._runtimes:
             if num_tokens <= max_tok_per_rank:
-                return runtime
+                return runtime, num_tokens
         raise ValueError(
             f"{num_tokens} tokens exceeds MegaMoE capacity {self.max_num_tokens}"
         )
@@ -271,7 +275,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
         assert self._runtimes
-        runtime = self.select_runtime(hidden_states.shape[0])
+        runtime, config_tokens = self.select_runtime(hidden_states.shape[0])
         if self.fuse_shared_expert:
             topk_weights, topk_ids = self.append_shared_expert(topk_weights, topk_ids)
         # MegaMoEV2 reads these per launch; rebind to this layer's experts.
@@ -279,7 +283,12 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         runtime._s1_w1_scale = self.w13_weight_scale
         runtime.w2 = self.w2_weight
         runtime.w2_scale = self.w2_weight_scale
-        return runtime.forward(hidden_states.contiguous(), topk_weights, topk_ids)
+        return runtime.forward(
+            hidden_states.contiguous(),
+            topk_weights,
+            topk_ids,
+            config_tokens=config_tokens,
+        )
 
 
 DeepseekV4AiterMegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]

@@ -137,9 +137,10 @@ def test_runtime_selected_by_max_tokens_across_dp(
             )
         ),
     )
-    # Every rank must take the same runtime, so a small local batch still gets
-    # the prefill runtime when another DP rank is over the decode capacity.
-    assert experts.select_runtime(4) == expected
+    # Every rank must take the same runtime and kernel config, so a small local
+    # batch still gets the prefill runtime when another DP rank is over the
+    # decode capacity, and reports the DP-wide token count as config_tokens.
+    assert experts.select_runtime(4) == (expected, max(tokens_across_dp))
 
 
 @pytest.mark.cpu_test
