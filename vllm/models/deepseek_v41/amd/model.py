@@ -11,6 +11,7 @@ import torch.nn as nn
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import (
+    get_engram_dp_size,
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
@@ -67,7 +68,12 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.worker.ubatching import dbo_current_ubatch_id
 
-from ..common.engram import Engram, EngramLayout, NgramHashState
+from ..common.engram import (
+    Engram,
+    EngramLayout,
+    NgramHashState,
+    gather_engram_hashes,
+)
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
 
 if typing.TYPE_CHECKING:
@@ -604,6 +610,9 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # layer's sliding-window KV cache. Only PP ranks owning an engram
         # layer need it.
         self.engram_hash: NgramHashState | None = None
+        self.engram_dp_shared_memory = bool(
+            vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory
+        )
         self.engram_swa_prefix: str | None = None
         if self.engram_layout is not None:
             local_engram = any(
@@ -735,12 +744,21 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
+            elif not self.engram_dp_shared_memory and get_engram_dp_size() > 1:
+                # DP-sharded lookups are collective, so a replica skipping the
+                # hash still has to reach them.
+                engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
+            if engram_hashes is not None:
                 # Gather all Engram rows before entering the decoder layers.
+                # A DP-sharded table looks up every replica's hashes.
+                gathered_hashes = gather_engram_hashes(
+                    engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
+                )
                 for layer in islice(self.layers, self.start_layer, self.end_layer):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
                         engram.prepare_embeddings(
-                            engram_hashes[:, engram.layer_hash_index]
+                            gathered_hashes[:, engram.layer_hash_index]
                         )
 
         full_num_tokens = positions.shape[0]
