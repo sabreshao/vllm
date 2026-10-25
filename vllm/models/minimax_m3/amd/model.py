@@ -145,7 +145,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
 from vllm.multimodal import MULTIMODAL_REGISTRY
-from vllm.platforms.rocm import on_gfx942
+from vllm.platforms.rocm import on_gfx942, on_gfx950
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
@@ -753,8 +753,14 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main cache
         # (--attention-config '{"indexer_kv_dtype": ...}'). fp8 e4m3 is what the
         # MSA indexer needs; bf16 keeps the platform-neutral indexer.
+        # With an NVFP4 K/V cache off gfx950 the index cache defaults to NVFP4
+        # too: its pages are then an exact fraction of the main pages, which the
+        # hybrid allocator would otherwise pad up to the next power of two.
+        triton_nvfp4_kv = (
+            get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4 and not on_gfx950()
+        )
         self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
-            "bf16"
+            "nvfp4" if triton_nvfp4_kv else "bf16"
         )
 
         # Shared top-k buffer: the indexer writes the selected blocks into it and
@@ -763,6 +769,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # One fused kernel inserts both caches, so NVFP4 K/V needs an NVFP4
         # index cache.
         self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
+        # The FlyDSL NVFP4 kernels are gfx950-only. Elsewhere the portable
+        # Triton path stores K/V in NVFP4 and keeps the platform-neutral indexer.
+        self.use_flydsl_nvfp4_kv = self.use_nvfp4_kv and on_gfx950()
         # Indexer and main attention are separate impls. This indexer is
         # ROCm-only, so the model selects it rather than the neutral
         # MiniMaxM3Indexer, which knows nothing about it and would pick its own.
@@ -823,7 +832,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.sparse_ctx_buffer = sparse_ctx_buffer
         # Same condition the forward dispatches on, so the indexer built here
         # and the branch that calls it cannot disagree about which one this is.
-        if self.use_nvfp4_kv:
+        if self.use_flydsl_nvfp4_kv:
             self.indexer = MiniMaxM3MSAIndexer(
                 impl_cls=MiniMaxM3IndexerRocmNvfp4Impl, **indexer_kwargs
             )
@@ -1110,6 +1119,83 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         )
         return q, index_q
 
+    def _norm_rope_triton_nvfp4_insert(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        index_slot_mapping: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Norm + RoPE, then the portable Triton NVFP4 K/V and index-K inserts
+        (bf16 index-K if so configured); returns q, index-q (None on top-k
+        reuse layers)."""
+        from vllm.models.minimax_m3.amd.ops.sparse_pa import (
+            minimax_m3_insert_index_cache,
+        )
+        from vllm.models.minimax_m3.common.ops.nvfp4_triton import (
+            nvfp4_index_insert,
+            nvfp4_kv_insert,
+        )
+
+        num_tokens = qkv.shape[0]
+        cos_sin_cache = self.rotary_emb.cos_sin_cache
+        rotary_dim = self.rotary_emb.rotary_dim
+        eps = self.q_norm.variance_epsilon
+        q = qkv.new_empty((num_tokens, self.q_size))
+        index_q = None
+        # Without caches the fused kernel only normalizes and ropes, writing q
+        # (and index-q) out and k / index-k back into qkv.
+        if self.skip_index_topk:
+            ops.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                rotary_dim,
+                eps,
+                num_index_heads=self.num_idx_heads,
+                q_out=q,
+                skip_index_branch=True,
+            )
+        else:
+            # The Triton scorer takes a bf16 index-q for a bf16 or NVFP4 cache.
+            index_q = qkv.new_empty((num_tokens, self.index_q_size))
+            ops.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                rotary_dim,
+                eps,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+                self.num_idx_heads,
+                q_out=q,
+                index_q_out=index_q,
+            )
+        k_start = self.q_size
+        v_start = k_start + self.kv_size
+        k = qkv[:, k_start:v_start].view(num_tokens, self.num_kv_heads, self.head_dim)
+        v = qkv[:, v_start : v_start + self.kv_size].view(
+            num_tokens, self.num_kv_heads, self.head_dim
+        )
+        nvfp4_kv_insert(k, v, self.kv_cache, slot_mapping, self._k_scale, self._v_scale)
+        if index_q is not None and index_slot_mapping is not None:
+            index_k_start = v_start + self.kv_size + self.index_q_size
+            index_k = qkv[:, index_k_start : index_k_start + self.idx_head_dim]
+            index_cache = self.indexer.index_cache.kv_cache
+            if index_cache.dtype == torch.uint8:
+                nvfp4_index_insert(index_k, index_cache, index_slot_mapping)
+            else:
+                minimax_m3_insert_index_cache(index_k, index_cache, index_slot_mapping)
+        return q, index_q
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1149,12 +1235,27 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             return output
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        if self.use_nvfp4_kv:
+        if self.use_flydsl_nvfp4_kv:
             q, index_q = self._norm_rope_nvfp4_insert(
                 qkv,
                 positions,
                 main_slot_mapping,
                 fwd_slot_mapping[self.indexer.index_cache.prefix],
+            )
+            output = torch.empty_like(q)
+            attn_output = self._run_attention(
+                q, None if self.skip_index_topk else index_q, output
+            )
+            output, _ = self.o_proj(attn_output)
+            return output
+        if self.use_nvfp4_kv:
+            q, index_q = self._norm_rope_triton_nvfp4_insert(
+                qkv,
+                positions,
+                main_slot_mapping,
+                None
+                if self.skip_index_topk
+                else fwd_slot_mapping[self.indexer.index_cache.prefix],
             )
             output = torch.empty_like(q)
             attn_output = self._run_attention(
@@ -1675,7 +1776,7 @@ class MiniMaxM3Model(nn.Module, EagleModelMixin):
                 vllm_config,
                 msa_indexer_selected=self.msa_indexer_impl_cls is not None,
             )
-            if use_nvfp4_kv:
+            if use_nvfp4_kv and on_gfx950():
                 # A TP collective (IPC buffers), outside graph capture.
                 init_rocm_nvfp4_indexer_decode_cp(
                     vllm_config.model_config.max_model_len
