@@ -14,9 +14,11 @@ from vllm.models.minimax_m3.common.ops.sparse_attn import (
     _FP8_DTYPES,
     _KV_SCALE_NONE,
     SPARSE_BLOCK_SIZE,
+    _kv_layout_args,
     _kv_scale_args,
     minimax_m3_sparse_attn_decode,
 )
+from vllm.models.minimax_m3.common.ops.nvfp4_triton import nvfp4_load_dequant
 from vllm.platforms.rocm import on_gfx950, on_mi3xx
 from vllm.triton_utils import tl, triton
 
@@ -96,6 +98,7 @@ def _gqa_sparse_fwd_kernel(
     stride_kv_h,
     stride_kv_pos,
     stride_kv_d,
+    stride_kv_side,  # NVFP4: byte offset of a head's V slot from its K slot
     stride_ks_h,
     stride_ks_t,
     stride_vs_h,
@@ -114,6 +117,7 @@ def _gqa_sparse_fwd_kernel(
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_QH: tl.constexpr,
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
+    KV_NVFP4: tl.constexpr,  # NVFP4 head-slot cache, k/v_scale are global scales
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
     SUB_K: tl.constexpr,  # CDNA only: KV sub-tile width (see _IS_MI3XX)
 ):
@@ -168,26 +172,35 @@ def _gqa_sparse_fwd_kernel(
                 off_sub = tl.arange(0, SUB_K) + sub_i * SUB_K
                 pos_sub = c + off_sub
                 pos_mask_sub = pos_sub < seq_len
-                k_sub = tl.load(
-                    kv_base
-                    + off_sub[None, :] * stride_kv_pos
-                    + off_d[:, None] * stride_kv_d,
-                    mask=d_mask[:, None] & pos_mask_sub[None, :],
-                    other=0.0,
-                )
-                if USE_FP8:
-                    k_sub = k_sub.to(q.dtype)
-                    if KV_SCALE_MODE == 1:
-                        k_sub = (k_sub * tl.load(k_scale_ptr)).to(q.dtype)
-                    elif KV_SCALE_MODE == 2:
-                        k_scale = tl.load(
-                            k_scale_ptr
-                            + pid_kh * stride_ks_h
-                            + (page * BLOCK_SIZE_K + off_sub) * stride_ks_t,
-                            mask=pos_mask_sub,
-                            other=1.0,
-                        )
-                        k_sub = (k_sub * k_scale[None, :]).to(q.dtype)
+                if KV_NVFP4:
+                    k_sub = nvfp4_load_dequant(
+                        kv_base + off_sub[None, :] * stride_kv_pos,
+                        off_d[:, None],
+                        d_mask[:, None] & pos_mask_sub[None, :],
+                        tl.load(k_scale_ptr),
+                        HEAD_DIM=BLOCK_SIZE_D,
+                    ).to(q.dtype)
+                else:
+                    k_sub = tl.load(
+                        kv_base
+                        + off_sub[None, :] * stride_kv_pos
+                        + off_d[:, None] * stride_kv_d,
+                        mask=d_mask[:, None] & pos_mask_sub[None, :],
+                        other=0.0,
+                    )
+                    if USE_FP8:
+                        k_sub = k_sub.to(q.dtype)
+                        if KV_SCALE_MODE == 1:
+                            k_sub = (k_sub * tl.load(k_scale_ptr)).to(q.dtype)
+                        elif KV_SCALE_MODE == 2:
+                            k_scale = tl.load(
+                                k_scale_ptr
+                                + pid_kh * stride_ks_h
+                                + (page * BLOCK_SIZE_K + off_sub) * stride_ks_t,
+                                mask=pos_mask_sub,
+                                other=1.0,
+                            )
+                            k_sub = (k_sub * k_scale[None, :]).to(q.dtype)
                 off_q_sub = (
                     tl.arange(0, BLOCK_SIZE_Q)[:, None]
                     + pid_q_j * BLOCK_SIZE_Q
@@ -204,26 +217,35 @@ def _gqa_sparse_fwd_kernel(
                 p_sub = tl.exp2(qk_sub - m_ij[:, None])
                 l_ij = tl.sum(p_sub, axis=1)
                 acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-                v_sub = tl.load(
-                    kv_base
-                    + off_sub[:, None] * stride_kv_pos
-                    + (head_dim + off_d[None, :]) * stride_kv_d,
-                    mask=pos_mask_sub[:, None] & d_mask[None, :],
-                    other=0.0,
-                )
-                if USE_FP8:
-                    v_sub = v_sub.to(q.dtype)
-                    if KV_SCALE_MODE == 1:
-                        v_sub = (v_sub * tl.load(v_scale_ptr)).to(q.dtype)
-                    elif KV_SCALE_MODE == 2:
-                        v_scale = tl.load(
-                            v_scale_ptr
-                            + pid_kh * stride_vs_h
-                            + (page * BLOCK_SIZE_K + off_sub) * stride_vs_t,
-                            mask=pos_mask_sub,
-                            other=1.0,
-                        )
-                        v_sub = (v_sub * v_scale[:, None]).to(q.dtype)
+                if KV_NVFP4:
+                    v_sub = nvfp4_load_dequant(
+                        kv_base + stride_kv_side + off_sub[:, None] * stride_kv_pos,
+                        off_d[None, :],
+                        pos_mask_sub[:, None] & d_mask[None, :],
+                        tl.load(v_scale_ptr),
+                        HEAD_DIM=BLOCK_SIZE_D,
+                    ).to(q.dtype)
+                else:
+                    v_sub = tl.load(
+                        kv_base
+                        + off_sub[:, None] * stride_kv_pos
+                        + (head_dim + off_d[None, :]) * stride_kv_d,
+                        mask=pos_mask_sub[:, None] & d_mask[None, :],
+                        other=0.0,
+                    )
+                    if USE_FP8:
+                        v_sub = v_sub.to(q.dtype)
+                        if KV_SCALE_MODE == 1:
+                            v_sub = (v_sub * tl.load(v_scale_ptr)).to(q.dtype)
+                        elif KV_SCALE_MODE == 2:
+                            v_scale = tl.load(
+                                v_scale_ptr
+                                + pid_kh * stride_vs_h
+                                + (page * BLOCK_SIZE_K + off_sub) * stride_vs_t,
+                                mask=pos_mask_sub,
+                                other=1.0,
+                            )
+                            v_sub = (v_sub * v_scale[:, None]).to(q.dtype)
                 acc_o += tl.dot(p_sub.to(v_sub.dtype), v_sub)
                 m_i = m_ij
                 lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
@@ -257,13 +279,19 @@ def minimax_m3_sparse_attn(
     output: torch.Tensor,  # [total_q, num_heads, head_dim]
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    kv_nvfp4: bool = False,
 ) -> None:
-    """GQA block-sparse attention over the selected blocks. block_size_q == 1."""
+    """GQA block-sparse attention over the selected blocks. block_size_q == 1.
+
+    With ``kv_nvfp4`` the cache is the NVFP4 head-slot layout of
+    ``nvfp4_triton`` and ``k_scale`` / ``v_scale`` are its global scales.
+    """
     total_q, num_heads, head_dim = q.shape
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
-    use_fp8 = kv_cache.dtype in _FP8_DTYPES
+    use_fp8 = not kv_nvfp4 and kv_cache.dtype in _FP8_DTYPES
+    kv_cache, kv_strides = _kv_layout_args(kv_cache, num_kv_heads, head_dim, kv_nvfp4)
     (
         k_scale_arg,
         v_scale_arg,
@@ -275,6 +303,8 @@ def minimax_m3_sparse_attn(
     ) = (
         _kv_scale_args(output, num_kv_heads, k_scale, v_scale)
         if use_fp8
+        else (k_scale, v_scale, 0, 0, 0, 0, _KV_SCALE_NONE)
+        if kv_nvfp4
         else (
             output,
             output,
@@ -307,10 +337,7 @@ def minimax_m3_sparse_attn(
         q.stride(0),
         q.stride(1),
         q.stride(2),
-        kv_cache.stride(0),
-        kv_cache.stride(1),
-        kv_cache.stride(2),
-        kv_cache.stride(3),
+        *kv_strides,
         stride_ks_h,
         stride_ks_t,
         stride_vs_h,
@@ -325,6 +352,7 @@ def minimax_m3_sparse_attn(
         BLOCK_SIZE_Q=1,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         USE_FP8=use_fp8,
+        KV_NVFP4=kv_nvfp4,
         KV_SCALE_MODE=kv_scale_mode,
         SUB_K=_SPARSE_ATTN_SUB_K,
         **_sparse_attn_prefill_kwargs(),

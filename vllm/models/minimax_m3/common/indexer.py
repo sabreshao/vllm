@@ -557,6 +557,14 @@ def select_indexer_impl_cls(
             f"indexer_kv_dtype={indexer_kv_dtype!r} requires CUDA fp8 support."
         )
     is_sm100 = is_cuda and current_platform.is_device_capability_family(100)
+    if indexer_kv_dtype == "nvfp4" and current_platform.is_rocm():
+        # The ROCm Triton scorer dequantizes NVFP4 index pages on load
+        # (common/ops/nvfp4_triton.py); gfx950 picks its FlyDSL indexer earlier.
+        logger.info_once(
+            "MiniMax M3 indexer: selected Triton NVFP4 (ROCm) [topk_blocks=%d]",
+            topk_blocks,
+        )
+        return MiniMaxM3IndexerTritonImpl
     if indexer_kv_dtype == "nvfp4":
         if not (
             is_cuda

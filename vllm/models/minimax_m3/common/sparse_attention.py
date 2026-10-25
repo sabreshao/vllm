@@ -15,7 +15,7 @@ attention-backend registry (by dotted path) and by spec-decode, so they must
 keep these names and stay in this module.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import ClassVar
 
 import torch
@@ -40,6 +40,7 @@ else:
         minimax_m3_sparse_attn,
         minimax_m3_sparse_attn_decode,
     )
+from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -448,6 +449,10 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
 class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
     """Triton block-sparse attend (``minimax_m3_sparse_attn``) + Triton decode."""
 
+    # NVFP4 head-slot cache of ``common/ops/nvfp4_triton.py`` (see
+    # MiniMaxM3SparseTritonNvfp4Backend); the layer's k/v scales are global.
+    kv_nvfp4: ClassVar[bool] = False
+
     def forward(
         self,
         layer: AttentionLayer,
@@ -476,11 +481,17 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
         hd = self.head_size
         q = query[:num_tokens].view(-1, self.num_heads, hd)
         out = output[:num_tokens].view(-1, self.num_heads, hd)
-        kv_cache = (
-            kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
-        )
-        k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
-        v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
+        if self.kv_nvfp4:
+            k_scale = layer._k_scale  # type: ignore[attr-defined]
+            v_scale = layer._v_scale  # type: ignore[attr-defined]
+        else:
+            kv_cache = (
+                kv_cache.view(self.kv_cache_fp8_dtype)
+                if self.use_fp8_kv
+                else kv_cache
+            )
+            k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
+            v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
 
         # Decode [:nd]: split-K over the selected blocks (request-major chunks).
         if main_md.num_decodes > 0:
@@ -498,6 +509,7 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 d.decode_query_len,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                kv_nvfp4=self.kv_nvfp4,
             )
 
         # Prefill [nd:]: cu_seqlens_q already rebased to 0.
@@ -518,8 +530,39 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
                 out[nd:],
                 k_scale=k_scale,
                 v_scale=v_scale,
+                kv_nvfp4=self.kv_nvfp4,
             )
         return output
+
+
+class MiniMaxM3SparseTritonNvfp4Impl(MiniMaxM3SparseTritonImpl):
+    """The Triton attend over the portable NVFP4 K/V cache."""
+
+    kv_nvfp4 = True
+
+
+class MiniMaxM3SparseTritonNvfp4Backend(MiniMaxM3SparseBackend):
+    """MiniMax M3 sparse attend over NVFP4 K/V pages with the portable Triton
+    kernels (ROCm archs without the gfx950 FlyDSL ones, e.g. gfx1250)."""
+
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["nvfp4"]
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        """Store each head's K and V as two slots of token rows ``[data | scales]``."""
+        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_nvfp4:
+            return spec
+        return replace(
+            spec,
+            num_head_slots=2 * spec.num_kv_heads,
+            state_content_bytes=nvfp4_kv_cache_full_dim(spec.head_size)
+            * get_dtype_size(spec.dtype),
+        )
+
+    @classmethod
+    def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...] | None:
+        # The kernels address pages, head slots and token rows by stride.
+        return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
 
 
 def select_main_backend_and_impl_cls(
@@ -534,8 +577,9 @@ def select_main_backend_and_impl_cls(
     Blackwell (SM100) uses the MSA attend for supported top-k block counts
     when the KV cache is BF16, FP8 E4M3 or NVFP4; MI355 uses AITER sparse PA
     with shuffle KV cache layout; Other platforms and FP8 E5M2 fall
-    back to Triton. NVFP4 is MSA-only. The MSA modules are imported lazily to
-    avoid import errors on unsupported platforms.
+    back to Triton. NVFP4 uses MSA on SM100, the FlyDSL kernels on gfx950 and
+    the portable Triton kernels on other ROCm archs. The MSA modules are
+    imported lazily to avoid import errors on unsupported platforms.
     """
     use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
         num_kv_heads, emits_sparse_block_table=emits_sparse_block_table
@@ -553,6 +597,16 @@ def select_main_backend_and_impl_cls(
             f"cache dtype, got {kv_cache_dtype}"
         )
     if use_nvfp4 and current_platform.is_rocm():
+        from vllm.platforms.rocm import on_gfx950
+
+        if not on_gfx950():
+            # The FlyDSL NVFP4 kernels are gfx950-only (MFMA); others use the
+            # portable Triton kernels over a token-major NVFP4 cache.
+            logger.info_once(
+                "MiniMax M3 sparse attention selected Triton NVFP4 (topk_blocks=%s)",
+                topk_blocks,
+            )
+            return MiniMaxM3SparseTritonNvfp4Backend, MiniMaxM3SparseTritonNvfp4Impl
         from vllm.models.minimax_m3.amd.sparse_attention_nvfp4 import (
             MiniMaxM3SparseRocmNvfp4Backend,
             MiniMaxM3SparseRocmNvfp4Impl,

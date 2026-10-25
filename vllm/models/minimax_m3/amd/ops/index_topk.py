@@ -22,6 +22,7 @@ from vllm.models.minimax_m3.amd.ops.sparse_pa import (
     PAGES_PER_SPARSE_BLOCK,
     _write_sparse_block_table_row_from_values,
 )
+from vllm.models.minimax_m3.common.ops.nvfp4_triton import nvfp4_index_load_dequant
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import round_up
@@ -216,6 +217,7 @@ def _index_block_score_kernel(
     stride_bt_b,
     BLOCK_SIZE_Q: tl.constexpr,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
+    IK_NVFP4: tl.constexpr = False,  # NVFP4 index pages (nvfp4_triton)
 ):
     pid_q = tl.program_id(0)
     pid_bh = tl.program_id(1)
@@ -256,12 +258,21 @@ def _index_block_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[None, :] * stride_ik_pos
-            + off_d[:, None] * stride_ik_d,
-        )
+        if IK_NVFP4:
+            k = nvfp4_index_load_dequant(
+                ik_cache_ptr + page * stride_ik_blk,
+                off_k[None, :],
+                off_d[:, None],
+                BLOCK_SIZE_K,
+                head_dim,
+            ).to(q.dtype)
+        else:
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[None, :] * stride_ik_pos
+                + off_d[:, None] * stride_ik_d,
+            )
         qk = tl.dot(q, k)
         # apply causal mask as needed
         if q_start < i + BLOCK_SIZE_K:
@@ -433,6 +444,7 @@ def _decode_index_score_kernel(
     BLOCK_SIZE_Q: tl.constexpr,
     num_kv_chunks,
     USE_PDL: tl.constexpr,
+    IK_NVFP4: tl.constexpr = False,  # NVFP4 index pages (nvfp4_triton)
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     pid_r = tl.program_id(0)
@@ -483,12 +495,21 @@ def _decode_index_score_kernel(
         # we don't need masked load for K, because KV cache ensures
         # allocation is multiple of BLOCK_SIZE_K.
         # for tokens beyond seqlen, they will be masked in qk later.
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[:, None] * stride_ik_pos
-            + off_d * stride_ik_d,
-        )  # [N,D]
+        if IK_NVFP4:
+            k = nvfp4_index_load_dequant(
+                ik_cache_ptr + page * stride_ik_blk,
+                off_k[:, None],
+                off_d[None, :],
+                BLOCK_SIZE_K,
+                head_dim,
+            ).to(q.dtype)  # [N,D]
+        else:
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[:, None] * stride_ik_pos
+                + off_d * stride_ik_d,
+            )  # [N,D]
         if BLOCK_SIZE_HQ == 1:
             # Degenerate GEMV (q is [D,1]): vectorized fp32 multiply + reduce
             # instead of an MFMA tile. Numerically equivalent to tl.dot.
@@ -545,6 +566,7 @@ def _decode_index_score_mapped_range(
     stride_bt_b,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_Q: tl.constexpr,
+    IK_NVFP4: tl.constexpr,
 ):
     BLOCK_SIZE_HQ: tl.constexpr = num_idx_heads * BLOCK_SIZE_Q
     hq_offsets = tl.arange(0, BLOCK_SIZE_HQ)
@@ -580,12 +602,21 @@ def _decode_index_score_mapped_range(
             page = tl.load(bt_row + blk).to(tl.int64)
             pos = blk * BLOCK_SIZE_K + off_k
             pos_mask = pos[:, None] < kv_len[None, :]
-            k = tl.load(
-                ik_cache_ptr
-                + page * stride_ik_blk
-                + off_k[:, None] * stride_ik_pos
-                + off_d * stride_ik_d,
-            )
+            if IK_NVFP4:
+                k = nvfp4_index_load_dequant(
+                    ik_cache_ptr + page * stride_ik_blk,
+                    off_k[:, None],
+                    off_d[None, :],
+                    BLOCK_SIZE_K,
+                    head_dim,
+                ).to(q.dtype)
+            else:
+                k = tl.load(
+                    ik_cache_ptr
+                    + page * stride_ik_blk
+                    + off_k[:, None] * stride_ik_pos
+                    + off_d * stride_ik_d,
+                )
             if BLOCK_SIZE_HQ == 1:
                 q_vec = tl.sum(q, axis=1).to(tl.float32)
                 kq = tl.sum(
@@ -644,6 +675,7 @@ def _decode_index_score_balanced_kernel(
     stride_bt_b,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_Q: tl.constexpr,
+    IK_NVFP4: tl.constexpr = False,  # NVFP4 index pages (nvfp4_triton)
 ):
     pid = tl.program_id(0)
     total_blocks = tl.zeros((), dtype=tl.int32)
@@ -724,6 +756,7 @@ def _decode_index_score_balanced_kernel(
         stride_bt_b,
         BLOCK_SIZE_K,
         BLOCK_SIZE_Q,
+        IK_NVFP4,
     )
 
 
@@ -1237,6 +1270,7 @@ def minimax_m3_index_score(
         block_table.stride(0),
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        IK_NVFP4=index_kv_cache.dtype == torch.uint8,
     )
     return score
 
@@ -1485,6 +1519,7 @@ def minimax_m3_index_decode(
             block_table.stride(0),
             BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
             BLOCK_SIZE_Q=BLOCK_SIZE_Q,
+            IK_NVFP4=index_kv_cache.dtype == torch.uint8,
             num_warps=2,
             num_stages=1,
         )
@@ -1528,6 +1563,7 @@ def minimax_m3_index_decode(
             BLOCK_SIZE_Q=BLOCK_SIZE_Q,
             num_kv_chunks=num_kv_chunks,
             USE_PDL=use_pdl,
+            IK_NVFP4=index_kv_cache.dtype == torch.uint8,
             **score_kwargs,
         )
 
