@@ -16,6 +16,12 @@ from . import kernel as _kernel
 
 @functools.cache
 def _get_kernel(nq: int, nkv: int, niq: int, rotary_dim: int, tp: int):
+    from vllm.platforms.rocm import on_gfx1250
+
+    if on_gfx1250():
+        from . import kernel_gfx1250
+
+        return kernel_gfx1250.compile_norm_rope_insert(nq, nkv, niq, rotary_dim, tp)
     return _kernel.compile_norm_rope_insert(nq, nkv, niq, rotary_dim, tp)
 
 
