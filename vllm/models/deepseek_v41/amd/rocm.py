@@ -86,18 +86,23 @@ def _trust_dsv4_extra_cache_nan_free(
     )
 
 
-def _aiter_sparse_mla_enabled(has_foreign_kv_writer: bool) -> bool:
+def _aiter_sparse_mla_enabled(
+    has_foreign_kv_writer: bool, packed_kv_cache: bool
+) -> bool:
     from vllm._aiter_ops import rocm_aiter_ops
 
     if not rocm_aiter_ops.is_triton_sparse_mla_enabled():
         return False
-    # The aiter kernel does not scrub NaNs, so like the trust check above it
-    # needs a cache only the canonical writer has touched.
-    if has_foreign_kv_writer:
+    # A cache a KV connector filled may hold bytes the canonical writer never
+    # produced. The aiter kernel then zeroes NaN values it gathers from the
+    # extra cache, like the Triton path (see
+    # DeepseekV41ROCMAiterMLAAttention._aiter_sparse_mla), but only for the
+    # packed fp8_ds_mla record: the per-tensor fp8 rows have no scrub.
+    if has_foreign_kv_writer and not packed_kv_cache:
         logger.warning_once(
             "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is ignored with a KV "
-            "connector that may load non-canonical KV; DeepSeek V4 keeps the "
-            "Triton sparse attention."
+            "connector that may load non-canonical KV into a per-tensor fp8 "
+            "cache; DeepSeek V4 keeps the Triton sparse attention."
         )
         return False
     return True
@@ -373,8 +378,10 @@ class DeepseekV41ROCMAiterSparseSWAMetadataBuilder(DeepseekV41SparseSWAMetadataB
             dtype=torch.int32,
             device=self.device,
         )
+        # The layers' init has written the resolved record back onto cache_dtype.
         self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(
-            kv_connector_may_load_foreign_kv(self.vllm_config)
+            kv_connector_may_load_foreign_kv(self.vllm_config),
+            self.vllm_config.cache_config.cache_dtype == "fp8_ds_mla",
         )
 
     def build(
@@ -600,7 +607,7 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                     "are not supported."
                 )
         self._use_aiter_sparse_mla = _aiter_sparse_mla_enabled(
-            self._has_foreign_kv_writer
+            self._has_foreign_kv_writer, self.kv_cache_dtype == "fp8_ds_mla"
         )
         if self.compressor is None and self.indexer is None:
             # Dense layers have nothing to overlap; keep the base serial path.
@@ -1487,7 +1494,10 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         assert (output is None) != (output_mxfp8 is None)
         # Both fp8 caches are read in place: the SWA window as the main segment,
         # the top-k compressed tokens as the extra one. With positions the
-        # store applies the inverse RoPE; output_mxfp8 replaces output.
+        # store applies the inverse RoPE; output_mxfp8 replaces output. A cache
+        # a KV connector filled is not trusted NaN-free (cf.
+        # _trust_dsv4_extra_cache_nan_free), so the kernel then zeroes NaN
+        # values it gathers from the extra cache.
         rocm_aiter_ops.triton_sparse_mla_fwd(
             q,
             swa_k_cache,
@@ -1499,6 +1509,8 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
             extra_kv_buffer=compressed_k_cache,
             extra_kv_indptr=topk_indptr,
             extra_kv_indices=topk_indices,
+            extra_scrub_nan=self._has_foreign_kv_writer
+            and compressed_k_cache is not None,
             inv_rope_positions=positions,
             inv_rope_cos_sin_cache=(
                 None if positions is None else self.rotary_emb.cos_sin_cache
