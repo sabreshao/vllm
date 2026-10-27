@@ -60,6 +60,7 @@ from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
     rocm_inverse_rope_mxfp8_rows,
     rocm_inverse_rope_rows_,
     rocm_mxfp8_wo_a_bmm,
+    rocm_mxfp8_wo_a_bmm_quant,
     rocm_sparse_attn_decode,
     rocm_sparse_attn_prefill,
 )
@@ -941,6 +942,19 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
         self, attn_out: torch.Tensor | QuantizedActivation, positions: torch.Tensor
     ) -> torch.Tensor:
         if isinstance(attn_out, QuantizedActivation):
+            if self._wo_b_takes_mxfp8:
+                zq, zs = rocm_mxfp8_wo_a_bmm_quant(
+                    attn_out.data,
+                    attn_out.scale,
+                    self.wo_a,
+                    self.n_local_groups,
+                    self.o_lora_rank,
+                )
+                return self.wo_b(
+                    QuantizedActivation(
+                        zq, zs, attn_out.orig_dtype, zq.shape, kMxfp8Dynamic
+                    )
+                )
             z = rocm_mxfp8_wo_a_bmm(
                 attn_out.data,
                 attn_out.scale,
@@ -969,6 +983,21 @@ class DeepseekV41ROCMAiterMLAAttention(DeepseekV4Attention):
                 self.wo_b.weight, self._wo_b_scale, zf, self.wo_b.reduce_results
             )
         return self.wo_b(zf)
+
+    @functools.cached_property
+    def _wo_b_takes_mxfp8(self) -> bool:
+        """wo_b reads an MXFP8 activation with row-major scales as is, so wo_a
+        can hand it MXFP8 directly instead of bf16 it would quantize again."""
+        from vllm.model_executor.kernels.linear.mxfp8.rocm_native import (
+            RocmDotScaledMxfp8LinearKernel,
+        )
+
+        kernel = getattr(getattr(self.wo_b, "quant_method", None), "kernel", None)
+        return (
+            self._wo_b_scale is None
+            and isinstance(kernel, RocmDotScaledMxfp8LinearKernel)
+            and RocmDotScaledMxfp8LinearKernel.supports_quantized_input(self.wo_b)
+        )
 
     def forward_mqa(
         self,
