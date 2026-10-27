@@ -20,20 +20,35 @@ def _pow2_ceil(n: int) -> int:
     return 1 << (n - 1).bit_length() if n >= 1 else 1
 
 
+@functools.cache
+def _arch_kernel():
+    from vllm.platforms.rocm import on_gfx1250
+
+    if on_gfx1250():
+        from . import prefill_kernel_gfx1250
+
+        return prefill_kernel_gfx1250
+    return _kernel
+
+
 @functools.lru_cache(maxsize=len(_kernel.PREFILL_STRIPS))
 def _get_prefill_kernel(strips: int):
-    return _kernel.compile_topk_prefill(strips)
+    return _arch_kernel().compile_topk_prefill(strips)
 
 
 @functools.lru_cache(maxsize=1)
 def _get_decode_kernel():
-    return _kernel.compile_topk_prefill(26, decode=True)
+    return _arch_kernel().compile_topk_prefill(26, decode=True)
 
 
 def supports_index_topk(topk_blocks: int, block_size: int) -> bool:
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
 
-    return on_gfx950() and topk_blocks == _kernel.TOPK and block_size == _kernel.BLK
+    return (
+        (on_gfx950() or on_gfx1250())
+        and topk_blocks == _kernel.TOPK
+        and block_size == _kernel.BLK
+    )
 
 
 def _check(score: torch.Tensor, topk_idx: torch.Tensor, max_seq_len: int) -> int:
