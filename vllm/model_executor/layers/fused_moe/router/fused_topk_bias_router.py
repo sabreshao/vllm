@@ -330,6 +330,30 @@ def fused_topk_bias(
             return _apply_eplb(topk_weights, topk_ids, eplb_state)
 
     if scoring_func == "sqrtsoftplus":
+        output_indices_dtype = torch.int32 if indices_type is None else indices_type
+        # The single-pass Triton top-k (one program per token) is ~3x faster
+        # than the C++ topkGatingSoftplusSqrt on MI355X and selects the same
+        # experts (lowest id wins ties in both).
+        if hash_indices_table is None and can_use_dsv4_topk(
+            gating_output,
+            e_score_correction_bias,
+            topk,
+            renormalize,
+            output_indices_dtype,
+        ):
+            return _apply_eplb(
+                *dsv4_topk(
+                    gating_output,
+                    e_score_correction_bias,
+                    output_indices_dtype,
+                    routed_scaling_factor,
+                    is_padding=get_moe_padding_mask(gating_output.shape[0]),
+                    input_ids=input_tokens,
+                    bias_vl=bias_vl,
+                    image_sentinel_lo=image_sentinel_lo,
+                ),
+                eplb_state,
+            )
         M = hidden_states.size(0)
         topk_weights = torch.empty(
             M, topk, dtype=torch.float32, device=hidden_states.device

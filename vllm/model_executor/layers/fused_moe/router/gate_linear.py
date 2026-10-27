@@ -531,7 +531,9 @@ def fp32_router_gemm_dispatch_impl(
     """
     if current_platform.is_rocm():
         from vllm.model_executor.layers.fused_moe.router.rocm_fp32_router_gemm import (  # noqa: E501
+            can_use_rocm_bf16_router_gemm_splitk,
             can_use_rocm_fp32_router_gemm,
+            rocm_bf16_router_gemm_splitk,
             rocm_fp32_router_gemm,
         )
 
@@ -539,6 +541,8 @@ def fp32_router_gemm_dispatch_impl(
             x = x.contiguous()
             if can_use_rocm_fp32_router_gemm(x, weight):
                 return rocm_fp32_router_gemm(x, weight)
+        if can_use_rocm_bf16_router_gemm_splitk(x, weight):
+            return rocm_bf16_router_gemm_splitk(x, weight)
         if weight.dtype == torch.bfloat16:
             return torch.mm(x, weight.T, out_dtype=torch.float32)
         return torch.nn.functional.linear(x.float(), weight)

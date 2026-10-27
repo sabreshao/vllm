@@ -4,6 +4,12 @@
 
 import torch
 
+from vllm.model_executor.kernels.linear.mxfp8.rocm_block32_gemm import (
+    _XCD_STRIDE,
+    _split_counters,
+    _split_tile,
+    _sum_splits,
+)
 from vllm.platforms import current_platform
 from vllm.platforms.rocm import on_gfx950
 from vllm.triton_utils import tl, triton
@@ -173,3 +179,118 @@ def rocm_fp32_router_gemm(
         num_stages=1,
     )
     return output
+
+
+# Mid-M BF16 router GEMM (32 < M <= _MAX_MFMA_TOKENS). hipBLASLt takes ~8.6 us
+# for [64, 5120] x [5120, 384] on MI355X (cold weight, graph replay); this
+# MFMA split-K kernel, with the in-launch ordered split reduction of the
+# block32 GEMM, takes ~5.8 us.
+_MAX_MFMA_TOKENS = 128
+
+
+@triton.jit
+def _rocm_bf16_router_gemm_splitk_kernel(
+    x_ptr,
+    w_ptr,
+    out_ptr,
+    slot_ptr,
+    count_ptr,
+    M,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    K_PER_SPLIT: tl.constexpr,
+    SPLITS: tl.constexpr,
+):
+    pid_m, pid_n, tile, pid_k = _split_tile(N, BLOCK_N, SPLITS)
+    if pid_m * BLOCK_M >= M:
+        return
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * K_PER_SPLIT + tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+    x_ptrs = x_ptr + offs_m[:, None] * K + offs_k[None, :]
+    w_ptrs = w_ptr + offs_n[:, None] * K + offs_k[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, K_PER_SPLIT, BLOCK_K):
+        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
+        acc = tl.dot(x, w.T, acc=acc)
+        x_ptrs += BLOCK_K
+        w_ptrs += BLOCK_K
+    _sum_splits(
+        acc,
+        out_ptr + offs_m[:, None] * N + offs_n[None, :],
+        m_mask[:, None] & n_mask[None, :],
+        slot_ptr + tile * (SPLITS * BLOCK_M * BLOCK_N),
+        count_ptr + tile,
+        pid_k,
+        SPLITS,
+    )
+
+
+def can_use_rocm_bf16_router_gemm_splitk(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> bool:
+    """gfx950, bf16 x bf16 -> fp32, 32 < M <= _MAX_MFMA_TOKENS, K % 2560 == 0."""
+    return (
+        current_platform.is_rocm()
+        and on_gfx950()
+        and hidden_states.dim() == 2
+        and router_weight.dim() == 2
+        and hidden_states.dtype == torch.bfloat16
+        and router_weight.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and router_weight.is_contiguous()
+        and hidden_states.shape[1] == router_weight.shape[1]
+        and hidden_states.shape[1] % 2560 == 0
+        and _MAX_TOKENS < hidden_states.shape[0] <= _MAX_MFMA_TOKENS
+    )
+
+
+def rocm_bf16_router_gemm_splitk(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+) -> torch.Tensor:
+    """`hidden_states @ router_weight.T` in fp32 for 32 < M <= 128 (gfx950).
+
+    Deterministic: split-K partials are summed in split order by the last
+    program of each output tile.
+    """
+    M, K = hidden_states.shape
+    N = router_weight.shape[0]
+    out = hidden_states.new_empty((M, N), dtype=torch.float32)
+    counters = _split_counters(out.device)
+    if counters is None:
+        return torch.mm(hidden_states, router_weight.T, out_dtype=torch.float32)
+    block_m = 64 if M <= 64 else 128
+    # (BLOCK_N, BLOCK_K, splits, warps, stages), swept on MI355X at M=64.
+    block_n, block_k, splits, warps, stages = 16, 256, 10, 4, 2
+    k_per_split = K // splits
+    tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    slots = torch.empty(
+        tiles * splits * block_m * block_n, dtype=torch.float32, device=out.device
+    )
+    grid = (triton.cdiv(tiles, _XCD_STRIDE) * _XCD_STRIDE * splits,)
+    _rocm_bf16_router_gemm_splitk_kernel[grid](
+        hidden_states,
+        router_weight,
+        out,
+        slots,
+        counters,
+        M,
+        N=N,
+        K=K,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        K_PER_SPLIT=k_per_split,
+        SPLITS=splits,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out
