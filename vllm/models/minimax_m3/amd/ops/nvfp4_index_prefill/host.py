@@ -52,8 +52,19 @@ def nvfp4_e4m3_lut(device: torch.device) -> torch.Tensor:
 
 
 @functools.cache
+def _arch_kernel():
+    from vllm.platforms.rocm import on_gfx1250
+
+    if on_gfx1250():
+        from . import kernel_gfx1250
+
+        return kernel_gfx1250
+    return _kernel
+
+
+@functools.cache
 def _get_kernel(heads: int):
-    return _kernel.compile_score_prefill(heads)
+    return _arch_kernel().compile_score_prefill(heads)
 
 
 def _kernel_shared():
@@ -69,11 +80,11 @@ def _get_kernel_shared(heads: int, mq: int):
 
 
 def _supported(q_idx, index_cache, score, *int32_tensors) -> bool:
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
 
     heads = q_idx.shape[1]
     return (
-        on_gfx950()
+        (on_gfx950() or on_gfx1250())
         and q_idx.dtype == torch.float8_e4m3fn
         and heads in (1, 2, 4)
         and q_idx.shape[2] == _kernel.D
@@ -113,10 +124,12 @@ def minimax_m3_nvfp4_index_score_prefill(
     assert max_blocks <= score.shape[2]
     work = max_blocks * cdiv(max_query_len, 256) * batch * heads
     small = max_query_len * heads <= 128 or work < SMALL_WORK
-    shared = small if PIN_SHARED is None else PIN_SHARED
+    kernel = _arch_kernel()
+    # kernel_shared.py is gfx950-only.
+    shared = (small if PIN_SHARED is None else PIN_SHARED) and kernel is _kernel
     mq = PIN_MQ or (1 if small else 2)
     target = SMALL_TARGET if shared and work < MID_WORK else TARGET_WORKGROUPS
-    tile_q = _kernel_shared().tile_q(mq) if shared else _kernel.TILE_Q
+    tile_q = _kernel_shared().tile_q(mq) if shared else kernel.TILE_Q
     qt = cdiv(max_query_len * heads, tile_q)
     min_seg = 1 if shared else _kernel.GROUP
     max_nseg = max(1, min(MAX_SEGMENTS, max_blocks // min_seg))
