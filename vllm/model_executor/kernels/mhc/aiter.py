@@ -224,9 +224,12 @@ def mhc_fused_post_pre_delayed_rms_norm_aiter(
     norm_weight: torch.Tensor,
     norm_eps: float,
     residual_out: torch.Tensor | None,
+    mxfp8_data: torch.Tensor | None = None,
+    mxfp8_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """`mhc_pre_delayed_aiter` with the RMSNorm of the collapse folded in:
-    `layer_input` comes back normalised with `norm_weight` / `norm_eps`."""
+    `layer_input` comes back normalised with `norm_weight` / `norm_eps`,
+    and also MXFP8-quantized into `mxfp8_data` / `mxfp8_scale` if given."""
     from vllm._aiter_ops import rocm_aiter_ops
 
     return rocm_aiter_ops.mhc_fused_post_pre_delayed_rms_norm(
@@ -246,6 +249,8 @@ def mhc_fused_post_pre_delayed_rms_norm_aiter(
         norm_weight,
         norm_eps,
         residual_out,
+        mxfp8_data,
+        mxfp8_scale,
     )
 
 
@@ -266,6 +271,8 @@ def _mhc_fused_post_pre_delayed_rms_norm_aiter_fake(
     norm_weight: torch.Tensor,
     norm_eps: float,
     residual_out: torch.Tensor | None,
+    mxfp8_data: torch.Tensor | None = None,
+    mxfp8_scale: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     return _mhc_pre_delayed_aiter_fake(
         residual,
@@ -411,7 +418,7 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="mhc_fused_post_pre_delayed_rms_norm_aiter",
     op_func=mhc_fused_post_pre_delayed_rms_norm_aiter,
-    mutates_args=["residual_out"],
+    mutates_args=["residual_out", "mxfp8_data", "mxfp8_scale"],
     fake_impl=_mhc_fused_post_pre_delayed_rms_norm_aiter_fake,
 )
 direct_register_custom_op(

@@ -361,6 +361,7 @@ class MHCPreDelayedOp(CustomOp):
         sublayer_out: torch.Tensor | None = None,
         post_layer_mix: torch.Tensor | None = None,
         comb_res_mix: torch.Tensor | None = None,
+        mxfp8_out: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = self._maybe_post(
             residual, sublayer_out, post_layer_mix, comb_res_mix
@@ -399,10 +400,13 @@ class MHCPreDelayedOp(CustomOp):
         sublayer_out: torch.Tensor | None = None,
         post_layer_mix: torch.Tensor | None = None,
         comb_res_mix: torch.Tensor | None = None,
+        mxfp8_out: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # aiter's fused delayed seam: post-mix, gate projection, and the
         # collapse with the carried pre-mix and its RMSNorm. It always applies
-        # the norm and projects `residual` itself.
+        # the norm and projects `residual` itself. With `mxfp8_out` it also
+        # writes the layer input MXFP8-quantized and attaches that copy to it
+        # (see mxfp8_companion), so its quantizing consumers skip a launch.
         if (
             HAS_AITER_MHC_FUSED_POST_PRE_DELAYED_RMS_NORM
             and x is None
@@ -412,6 +416,15 @@ class MHCPreDelayedOp(CustomOp):
             residual_out = (
                 torch.empty_like(residual) if sublayer_out is not None else None
             )
+            mxfp8_data = mxfp8_scale = None
+            if mxfp8_out:
+                from vllm.model_executor.layers.fusion.mxfp8_companion import (
+                    empty_mxfp8,
+                )
+
+                mxfp8_data, mxfp8_scale = empty_mxfp8(
+                    (*residual.shape[:-2], residual.shape[-1]), residual.device
+                )
             rest = torch.ops.vllm.mhc_fused_post_pre_delayed_rms_norm_aiter(
                 residual,
                 fn,
@@ -429,7 +442,16 @@ class MHCPreDelayedOp(CustomOp):
                 norm_weight,
                 norm_eps,
                 residual_out,
+                mxfp8_data,
+                mxfp8_scale,
             )
+            if mxfp8_data is not None:
+                from vllm.model_executor.layers.fusion.mxfp8_companion import (
+                    attach_mxfp8,
+                )
+
+                assert mxfp8_scale is not None
+                attach_mxfp8(rest[2], mxfp8_data, mxfp8_scale)
             return (residual if residual_out is None else residual_out), *rest
         # The unfused AITER delayed path drives mhc_pre_gemm_sqrsum against
         # `residual` and folds no RMSNorm, so it cannot serve the model-entry
@@ -531,6 +553,7 @@ class MHCPreDelayedOp(CustomOp):
         sublayer_out: torch.Tensor | None = None,
         post_layer_mix: torch.Tensor | None = None,
         comb_res_mix: torch.Tensor | None = None,
+        mxfp8_out: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         residual = self._maybe_post(
             residual, sublayer_out, post_layer_mix, comb_res_mix

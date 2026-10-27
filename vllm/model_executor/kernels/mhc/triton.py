@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from vllm.model_executor.warmup.jit_warmup import kernel_launcher
+from vllm.model_executor.warmup.jit_warmup import WarmupChoices, kernel_launcher
 from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     LaunchSpec,
     TritonWarmupTensor,
@@ -173,13 +173,20 @@ def _mhc_post_collapse_rms_norm_kernel(
     weight_ptr,
     residual_out_ptr,
     out_ptr,
+    mxfp8_data_ptr,
+    mxfp8_scale_ptr,
     norm_eps,
     H: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    QUANT_OUT: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    TINY: tl.constexpr,
 ):
     """The post-mix and collapse keep the expression order of aiter's
     `_mhc_fused_post_pre_delayed_rmsnorm_main_kernel`, so the new residual is
-    bit-identical to it."""
+    bit-identical to it. With QUANT_OUT the layer input is also written as
+    MXFP8 (e4m3 [T, H], row-major E8M0 [T, H // 32]) with the arithmetic of
+    `mxfp8_e4m3_quantize`, so the copy is bit-identical to quantizing it."""
     t = tl.program_id(0).to(tl.int64)
     cols = tl.arange(0, BLOCK_H)
     mask = cols < H
@@ -208,7 +215,26 @@ def _mhc_post_collapse_rms_norm_kernel(
     x1f = x1.to(tl.float32)
     rstd = tl.math.rsqrt(tl.sum(x1f * x1f, 0) * (1.0 / H) + norm_eps)
     w = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + t * H + cols, ((x1f * rstd) * w).to(tl.bfloat16), mask=mask)
+    y = ((x1f * rstd) * w).to(tl.bfloat16)
+    tl.store(out_ptr + t * H + cols, y, mask=mask)
+    if QUANT_OUT:
+        # H % 32 == 0, so the masked tail holds whole zero groups.
+        yb = tl.reshape(y.to(tl.float32), (BLOCK_H // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(yb), axis=1), TINY)
+        sb = tl.ceil(tl.log2(amax / FP8_MAX)) + 127.0
+        sb = tl.minimum(tl.maximum(sb, 0.0), 254.0)
+        q = tl.reshape(yb * tl.exp2(127.0 - sb)[:, None], (BLOCK_H,))
+        tl.store(
+            mxfp8_data_ptr + t * H + cols,
+            q.to(mxfp8_data_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        groups = tl.arange(0, BLOCK_H // 32)
+        tl.store(
+            mxfp8_scale_ptr + t * (H // 32) + groups,
+            sb.to(tl.uint8),
+            mask=groups < H // 32,
+        )
 
 
 class MHCPostCollapseRMSNormKernel(
@@ -219,23 +245,27 @@ class MHCPostCollapseRMSNormKernel(
         hidden_size: int
         block_h: int
         weight_dtype: torch.dtype
+        quant_out: bool
 
     kernel = staticmethod(_mhc_post_collapse_rms_norm_kernel)
 
     def dispatch(  # type: ignore[override]
-        self, *, hidden_size: int, weight_dtype: torch.dtype
+        self, *, hidden_size: int, weight_dtype: torch.dtype, quant_out: bool
     ) -> CompileKey:
         return self.CompileKey(
             hidden_size=hidden_size,
             block_h=next_power_of_2(hidden_size),
             weight_dtype=weight_dtype,
+            quant_out=quant_out,
         )
 
     def get_warmup_keys(
         self, *, hidden_size: int, weight_dtype: torch.dtype
     ) -> list[CompileKey]:
         return self._trace_dispatch(self.dispatch)(
-            hidden_size=hidden_size, weight_dtype=weight_dtype
+            hidden_size=hidden_size,
+            weight_dtype=weight_dtype,
+            quant_out=WarmupChoices(False, True),
         )
 
     def warmup_inputs(self, compile_key: CompileKey) -> dict[str, Any]:
@@ -250,6 +280,16 @@ class MHCPostCollapseRMSNormKernel(
             residual_out=TritonWarmupTensor(torch.bfloat16, shape=(1, 4, H)),
             out=TritonWarmupTensor(torch.bfloat16, shape=(1, H)),
             norm_eps=1e-6,
+            mxfp8_data=(
+                TritonWarmupTensor(torch.float8_e4m3fn, shape=(1, H))
+                if compile_key.quant_out
+                else None
+            ),
+            mxfp8_scale=(
+                TritonWarmupTensor(torch.uint8, shape=(1, H // 32))
+                if compile_key.quant_out
+                else None
+            ),
         )
 
     @kernel_launcher
@@ -264,9 +304,23 @@ class MHCPostCollapseRMSNormKernel(
         residual_out: Tensor,
         out: Tensor,
         norm_eps: float,
+        mxfp8_data: Tensor | None = None,
+        mxfp8_scale: Tensor | None = None,
     ) -> LaunchSpec:
         H = residual.shape[2]
-        return (residual.shape[0],), dict(H=H, BLOCK_H=next_power_of_2(H), num_warps=16)
+        quant_out = mxfp8_data is not None
+        assert quant_out == (mxfp8_scale is not None)
+        return (residual.shape[0],), dict(
+            # Without QUANT_OUT the kernel never reads these.
+            mxfp8_data_ptr=mxfp8_data if quant_out else out,
+            mxfp8_scale_ptr=mxfp8_scale if quant_out else out,
+            H=H,
+            BLOCK_H=next_power_of_2(H),
+            QUANT_OUT=quant_out,
+            FP8_MAX=float(torch.finfo(torch.float8_e4m3fn).max),
+            TINY=float(torch.finfo(torch.float32).tiny),
+            num_warps=16,
+        )
 
 
 MHC_POST_COLLAPSE_RMS_NORM_KERNEL = MHCPostCollapseRMSNormKernel()
@@ -280,6 +334,7 @@ def mhc_post_collapse_rms_norm_triton(
     pre_mix: Tensor,
     norm_weight: Tensor,
     norm_eps: float,
+    mxfp8_out: tuple[Tensor, Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """The layer-input half of a delayed mHC seam, without the gate projection.
 
@@ -295,6 +350,8 @@ def mhc_post_collapse_rms_norm_triton(
         pre_mix: [T, 4] fp32 pre gate carried from the previous seam.
         norm_weight: [H] RMSNorm weight.
         norm_eps: RMSNorm epsilon.
+        mxfp8_out: optional [T, H] e4m3 and [T, H // 32] uint8 E8M0 buffers
+            that also receive the layer input MXFP8-quantized.
 
     Returns:
         The [T, 4, H] bf16 new residual and the [T, H] bf16 layer input.
@@ -315,6 +372,7 @@ def mhc_post_collapse_rms_norm_triton(
             residual_out,
             out,
             norm_eps,
+            *(mxfp8_out or (None, None)),
         )
     return residual_out, out
 

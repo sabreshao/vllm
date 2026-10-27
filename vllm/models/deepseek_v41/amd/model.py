@@ -77,6 +77,7 @@ from vllm.models.deepseek_v41.amd.mono_decode import MonoDecodeLayer
 from vllm.models.deepseek_v41.amd.rocm import DeepseekV41ROCMAiterMLAAttention
 from vllm.models.deepseek_v41.attention import DeepseekV4Attention
 from vllm.models.deepseek_v41.decoder_replay_layers import DecoderReplayLayers
+from vllm.platforms.rocm import on_gfx950
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -307,6 +308,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         # attn_norm / ffn_norm into its collapse, so the separate norms are
         # skipped for the seams it takes.
         self.fuse_seam_norm = HAS_AITER_MHC_FUSED_POST_PRE_DELAYED_RMS_NORM
+        # The fused seam also writes its output MXFP8-quantized for the
+        # consumers that would quantize it again (fused_wqa_wkv and the shared
+        # expert's gate_up on the block32 GEMM, MoRI's MXFP8 dispatch).
+        self.seam_mxfp8 = self.fuse_seam_norm and on_gfx950()
         # Decode steps of an eligible layer may run as the mono decode layer.
         self.mono = MonoDecodeLayer.create(self, vllm_config)
         if self.mono is not None and self.mono.ffn_only:
@@ -414,6 +419,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     pre_mix=pre_mix,
                     norm_weight=self.attn_norm.weight if self.fuse_seam_norm else None,
                     norm_eps=self.attn_norm.variance_epsilon,
+                    mxfp8_out=self.seam_mxfp8,
                 )
         else:
             pre_args = (
@@ -444,6 +450,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     pre_mix=pre_mix,
                     norm_weight=self.attn_norm.weight if self.fuse_seam_norm else None,
                     norm_eps=self.attn_norm.variance_epsilon,
+                    mxfp8_out=self.seam_mxfp8,
                 )
             else:
                 (
@@ -461,6 +468,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     comb_res_mix=res_mix,
                     norm_weight=self.attn_norm.weight if self.fuse_seam_norm else None,
                     norm_eps=self.attn_norm.variance_epsilon,
+                    mxfp8_out=self.seam_mxfp8,
                 )
         if not fuse_attn_norm:
             x = self.attn_norm(x)
@@ -495,6 +503,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             comb_res_mix=res_mix,
             norm_weight=self.ffn_norm.weight if self.fuse_seam_norm else None,
             norm_eps=self.ffn_norm.variance_epsilon,
+            mxfp8_out=self.seam_mxfp8,
         )
         if not self.fuse_seam_norm:
             x = self.ffn_norm(x)

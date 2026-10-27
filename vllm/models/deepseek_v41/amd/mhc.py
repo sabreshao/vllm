@@ -6,6 +6,10 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.model_executor.kernels.mhc.triton import mhc_post_collapse_rms_norm_triton
+from vllm.model_executor.layers.fusion.mxfp8_companion import (
+    attach_mxfp8,
+    empty_mxfp8,
+)
 from vllm.model_executor.layers.mhc import (
     HAS_AITER_MHC_FUSED_POST_PRE_DELAYED_RMS_NORM,
     MHCPreDelayedOp,
@@ -67,6 +71,7 @@ def mhc_pre_delayed_overlap(
     sublayer_out: torch.Tensor | None = None,
     post_layer_mix: torch.Tensor | None = None,
     comb_res_mix: torch.Tensor | None = None,
+    mxfp8_out: bool = False,
     *,
     overlap: MHCOverlapStream,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -76,6 +81,8 @@ def mhc_pre_delayed_overlap(
     residual and layer input are ready on the caller stream; call
     `overlap.join()` before using the gates. Seams without a post block, a
     carried pre-mix or a fused norm run `pre_delayed` on the caller stream.
+    With `mxfp8_out` the layer input carries its MXFP8 copy as `pre_delayed`'s
+    does (see mxfp8_companion).
     """
     main = torch.cuda.current_stream()
     if (
@@ -106,7 +113,13 @@ def mhc_pre_delayed_overlap(
             sublayer_out=sublayer_out,
             post_layer_mix=post_layer_mix,
             comb_res_mix=comb_res_mix,
+            mxfp8_out=mxfp8_out,
         )
+    mxfp8 = (
+        empty_mxfp8((residual.shape[0], residual.shape[-1]), residual.device)
+        if mxfp8_out
+        else None
+    )
     residual, layer_input = mhc_post_collapse_rms_norm_triton(
         residual,
         sublayer_out,
@@ -115,7 +128,10 @@ def mhc_pre_delayed_overlap(
         pre_mix,
         norm_weight,
         norm_eps,
+        mxfp8,
     )
+    if mxfp8 is not None:
+        attach_mxfp8(layer_input, *mxfp8)
     stream = overlap.stream
     overlap.fork()
     with torch.cuda.stream(stream):

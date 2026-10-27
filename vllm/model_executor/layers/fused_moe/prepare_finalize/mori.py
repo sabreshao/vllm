@@ -109,16 +109,23 @@ class MoriPrepareAndFinalize(mk.FusedMoEPrepareAndFinalizeModular):
         elif self.use_mxfp8_dispatch and not defer_input_quant:
             from aiter import QuantType, dtypes, get_hip_quant
 
+            from vllm.model_executor.layers.fusion.mxfp8_companion import get_mxfp8
+
             # MXFP8 [M, K] with e8m0 scales [M, K // 32]. As with FP4 above the
             # scales stay unshuffled; AITER sorts them itself rather than
-            # re-quantizing when it receives a pre-quantized FP8 operand.
-            quant_func = get_hip_quant(QuantType.per_1x32)
-            a1, scale = quant_func(
-                a1,
-                quant_dtype=current_platform.fp8_dtype(),
-                scale_type=dtypes.fp8_e8m0,
-                shuffle=False,
-            )
+            # re-quantizing when it receives a pre-quantized FP8 operand. A copy
+            # the producer already wrote (bit-identical to this quant) is reused.
+            pre = get_mxfp8(a1)
+            if pre is not None:
+                a1, scale = pre[0], pre[1].view(dtypes.fp8_e8m0)
+            else:
+                quant_func = get_hip_quant(QuantType.per_1x32)
+                a1, scale = quant_func(
+                    a1,
+                    quant_dtype=current_platform.fp8_dtype(),
+                    scale_type=dtypes.fp8_e8m0,
+                    shuffle=False,
+                )
 
         # mori's combine() reduces over this rank's own [num_tokens, topk]
         # routing. The modular kernel rebinds topk_ids to the dispatched ids

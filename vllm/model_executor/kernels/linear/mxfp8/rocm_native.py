@@ -14,6 +14,7 @@ does not filter on K.
 import torch
 
 import vllm.envs as envs
+from vllm.model_executor.layers.fusion.mxfp8_companion import get_mxfp8
 from vllm.model_executor.layers.fusion.quant_activation import (
     QuantizedActivation,
     as_quantized_activation,
@@ -523,7 +524,12 @@ class RocmDotScaledMxfp8LinearKernel(Mxfp8LinearKernel):
         out_shape = (*in_shape[:-1], layer.weight.shape[0])
         if layer.weight_scale.shape[0] != layer.weight.shape[0]:
             # One scale row per 32 weight rows (see process_weights_after_loading).
-            if qa is not None:
+            pre = get_mxfp8(x) if qa is None else None
+            if pre is not None:
+                # The producer's MXFP8 copy of x (see mxfp8_companion).
+                x_q = pre[0].reshape(x2d.shape)
+                x_scale = pre[1].reshape(x2d.shape[0], -1)
+            if qa is not None or pre is not None:
                 out = rocm_mxfp8_block32_gemm(
                     x_q, x_scale, layer.weight, layer.weight_scale, out_dtype
                 )
