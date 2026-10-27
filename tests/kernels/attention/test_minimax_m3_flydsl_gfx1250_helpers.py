@@ -232,6 +232,43 @@ def test_cvt_fp8x2_every_byte():
     )
 
 
+def test_fp8x8_widen_every_byte():
+    """8-wide e4m3 -> f16 and -> bf16 on every finite byte."""
+    b = _e4m3_bytes()
+    b = torch.cat([b, b[: (-len(b)) % (LANES * 8)]])[: LANES * 8]
+    words = b.to(torch.uint8).view(torch.int32)  # [64]: 8 bytes per lane
+    ref = b.to(torch.uint8).view(torch.float8_e4m3fn).float().view(LANES, 8)
+
+    def body(lane, load):
+        h = g.cvt_fp8x8_f16(load(lane * 2), load(lane * 2 + 1)).bitcast(fx.Int32)
+        bf = g.cvt_fp8x8_bf16(load(lane * 2), load(lane * 2 + 1))
+        return [h[i] for i in range(4)] + [bf[i] for i in range(4)]
+
+    out = _run(body, words, 8, "fp8x8")
+    f16 = out[:, :4].contiguous().view(torch.float16).float()
+    bf16 = out[:, 4:].contiguous().view(torch.bfloat16).float()
+    assert torch.equal(f16, ref) and torch.equal(bf16, ref)
+
+
+def test_f16x8_fp8_rounding():
+    """8-wide fp16 -> e4m3: round to nearest even over [-448, 448], ties and
+    subnormals included."""
+    base = torch.tensor([1.0625, 1.1875, 0.0, -0.0, 2.0**-9, 2.0**-10, 448.0, -448.0])
+    vals = torch.cat([base, torch.linspace(-448, 448, LANES * 8 - 8)])
+    vals = vals.to(torch.float16)
+
+    def body(lane, load):
+        h = Vec.from_elements([load(lane * 4 + i) for i in range(4)], fx.Int32).bitcast(
+            fx.Float16
+        )
+        r = g.f16x8_fp8(h)
+        return [r[0], r[1]]
+
+    out = _run(body, vals.view(torch.int32), 2, "f16x8_fp8")
+    ref = vals.float().to(torch.float8_e4m3fn).view(torch.uint8)
+    assert torch.equal(out.contiguous().view(torch.uint8).flatten(), ref)
+
+
 def test_e4m3_roundtrip_and_rounding():
     """RNE e4m3 of fp32 in [-448, 448], ties included, against torch."""
     vals = torch.cat([

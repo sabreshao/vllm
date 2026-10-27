@@ -30,8 +30,20 @@ MAX_SPLIT_ROWS = 1024
 
 
 @functools.cache
+def _arch_kernel():
+    """The kernel module of this GPU and its (lanes, partial fp32) per row."""
+    from vllm.platforms.rocm import on_gfx1250
+
+    if on_gfx1250():
+        from . import kernel_gfx1250
+
+        return kernel_gfx1250, kernel_gfx1250.WAVE
+    return _kernel, 64
+
+
+@functools.cache
 def _get_kernel(splits: int, topk: int, xcds: int):
-    return _kernel.compile_nvfp4_sparse_decode(splits, topk, xcds)
+    return _arch_kernel()[0].compile_nvfp4_sparse_decode(splits, topk, xcds)
 
 
 def _query_xcd_count(device_index: int) -> int:
@@ -73,8 +85,9 @@ def _xcd_count(device_index: int) -> int:
 @functools.cache
 def _split_buffers(device: torch.device):
     """Split partials and tickets; allocated in the warm-up, before capture."""
+    kernel, lanes = _arch_kernel()
     part = torch.empty(
-        MAX_SPLIT_ROWS * MAX_SPLITS * 64 * _kernel.PART_F,
+        MAX_SPLIT_ROWS * MAX_SPLITS * lanes * kernel.PART_F,
         dtype=torch.float32,
         device=device,
     )

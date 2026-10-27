@@ -119,6 +119,47 @@ def cvt_fp8x2_bf16(word, hi):
     return fx.Int32(rocdl.cvt_pk_bf16_f32(fx.as_ir_value(f[0]), fx.as_ir_value(f[1])))
 
 
+def _fp8x8(word0, word1):
+    return fx.as_ir_value(
+        Vec.from_elements([fx.Int32(word0), fx.Int32(word1)], fx.Int32)
+    )
+
+
+def cvt_fp8x8_f16(word0, word1):
+    """The 8 e4m3 bytes of two dwords (word0 first) as 8 fp16 (exact)."""
+    return Vec(
+        rocdl.cvt_scale_pk8_f16_fp8(
+            Vec.make_type(8, fx.Float16),
+            _fp8x8(word0, word1),
+            fx.as_ir_value(fx.Int32(E8M0_ONE)),
+            0,
+        )
+    )
+
+
+def cvt_fp8x8_bf16(word0, word1):
+    """The 8 e4m3 bytes of two dwords as 4 dwords of bf16 pairs (exact)."""
+    return Vec(
+        rocdl.cvt_scale_pk8_bf16_fp8(
+            Vec.make_type(8, fx.BFloat16),
+            _fp8x8(word0, word1),
+            fx.as_ir_value(fx.Int32(E8M0_ONE)),
+            0,
+        )
+    ).bitcast(fx.Int32)
+
+
+def f16x8_fp8(v8):
+    """8 fp16 in [-448, 448] -> two dwords of RNE e4m3 bytes."""
+    return Vec(
+        rocdl.cvt_scalef32_pk8_fp8_f16(
+            Vec.make_type(2, fx.Int32),
+            fx.as_ir_value(Vec(v8)),
+            fx.as_ir_value(fx.Float32(1.0)),
+        )
+    )
+
+
 def f32x2_fp8(a, b, old=0, hi=False):
     """Two fp32 -> two RNE e4m3 bytes in the low (``hi``: high) half of ``old``.
     Callers clamp to +-448 first, as the gfx950 kernels do."""
