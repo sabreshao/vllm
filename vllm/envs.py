@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     VLLM_ROCM_MOE_PADDING: bool = True
     VLLM_ROCM_SHUFFLE_KV_CACHE_LAYOUT: bool = False
     VLLM_ROCM_MINIMAX_M3_SP_PREFILL: bool = False
+    VLLM_ROCM_MINIMAX_M3_NVFP4_FLYDSL: bool = True
     VLLM_ENABLE_V1_MULTIPROCESSING: bool = True
     VLLM_LOG_BATCHSIZE_INTERVAL: float = -1
     VLLM_DISABLE_COMPILE_CACHE: bool = False
@@ -1405,6 +1406,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # By default is disabled.
     "VLLM_ROCM_MINIMAX_M3_SP_PREFILL": lambda: (
         os.getenv("VLLM_ROCM_MINIMAX_M3_SP_PREFILL", "False").lower() in ("true", "1")
+    ),
+    # MiniMax-M3 NVFP4 K/V on gfx1250: the FlyDSL kernels (default) or, when
+    # disabled, the portable Triton ones. gfx950 always uses FlyDSL.
+    "VLLM_ROCM_MINIMAX_M3_NVFP4_FLYDSL": lambda: (
+        os.getenv("VLLM_ROCM_MINIMAX_M3_NVFP4_FLYDSL", "True").lower() in ("true", "1")
     ),
     # Custom quick allreduce kernel for MI3* cards
     # Choice of quantization level: FP, INT8, INT6, INT4, INT3 or NONE

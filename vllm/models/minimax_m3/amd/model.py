@@ -133,6 +133,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     MiniMaxM3SparseImpl,
     MiniMaxM3SparseMetadata,
     minimax_m3_rebase_slots_to_page16,
+    minimax_m3_rocm_flydsl_nvfp4,
     minimax_m3_use_aiter_sparse_pa,
     select_main_backend_and_impl_cls,
 )
@@ -773,14 +774,15 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main cache
         # (--attention-config '{"indexer_kv_dtype": ...}'). fp8 e4m3 is what the
         # AITER indexer needs; bf16 keeps the Triton indexer. With an NVFP4 K/V
-        # cache off gfx950 the index cache defaults to NVFP4 too: its pages are
-        # then an exact fraction of the main pages, which the hybrid allocator
-        # would otherwise pad up to the next power of two.
-        triton_nvfp4_kv = (
+        # cache off gfx950 the index cache defaults to NVFP4 too (the FlyDSL
+        # indexer needs it; for the Triton path its pages are then an exact
+        # fraction of the main pages, which the hybrid allocator would otherwise
+        # pad up to the next power of two).
+        nvfp4_index_default = (
             get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4 and not on_gfx950()
         )
         self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
-            "nvfp4" if triton_nvfp4_kv else "bf16"
+            "nvfp4" if nvfp4_index_default else "bf16"
         )
 
         # Shared top-k buffer: the indexer writes the selected blocks into it and
@@ -789,9 +791,9 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         # One fused kernel inserts both caches, so NVFP4 K/V needs an NVFP4
         # index cache.
         self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
-        # The FlyDSL NVFP4 kernels are gfx950-only. Elsewhere the portable
-        # Triton path stores K/V in NVFP4 and keeps the regular index cache.
-        self.use_flydsl_nvfp4_kv = self.use_nvfp4_kv and on_gfx950()
+        # FlyDSL NVFP4 kernels on gfx950 / gfx1250; elsewhere the portable
+        # Triton path.
+        self.use_flydsl_nvfp4_kv = self.use_nvfp4_kv and minimax_m3_rocm_flydsl_nvfp4()
         # Indexer and main attention are separate impls. The AITER indexer is
         # ROCm-only, so it is selected here rather than inside the neutral
         # MiniMaxM3Indexer, which knows nothing about it and would pick Triton.

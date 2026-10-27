@@ -486,9 +486,7 @@ class MiniMaxM3SparseTritonImpl(MiniMaxM3SparseImpl):
             v_scale = layer._v_scale  # type: ignore[attr-defined]
         else:
             kv_cache = (
-                kv_cache.view(self.kv_cache_fp8_dtype)
-                if self.use_fp8_kv
-                else kv_cache
+                kv_cache.view(self.kv_cache_fp8_dtype) if self.use_fp8_kv else kv_cache
             )
             k_scale = getattr(layer, "_k_scale", None) if self.use_fp8_kv else None
             v_scale = getattr(layer, "_v_scale", None) if self.use_fp8_kv else None
@@ -565,6 +563,17 @@ class MiniMaxM3SparseTritonNvfp4Backend(MiniMaxM3SparseBackend):
         return (KVCacheLayout.LBHNC, KVCacheLayout.BLHNC)
 
 
+def minimax_m3_rocm_flydsl_nvfp4() -> bool:
+    """Whether an NVFP4 K/V cache on ROCm uses the FlyDSL kernels (gfx950, and
+    gfx1250 unless VLLM_ROCM_MINIMAX_M3_NVFP4_FLYDSL=0) rather than the portable
+    Triton ones. Their page layouts differ, so the insert, attention and indexer
+    all follow this."""
+    from vllm import envs
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
+
+    return on_gfx950() or (on_gfx1250() and envs.VLLM_ROCM_MINIMAX_M3_NVFP4_FLYDSL)
+
+
 def select_main_backend_and_impl_cls(
     *,
     topk_blocks: int,
@@ -578,7 +587,7 @@ def select_main_backend_and_impl_cls(
     when the KV cache is BF16, FP8 E4M3 or NVFP4; MI355 uses AITER sparse PA
     with shuffle KV cache layout; Other platforms and FP8 E5M2 fall
     back to Triton. NVFP4 uses MSA on SM100, the FlyDSL kernels on gfx950 and
-    the portable Triton kernels on other ROCm archs. The MSA modules are
+    gfx1250 and the portable Triton kernels on other ROCm archs. The MSA modules are
     imported lazily to avoid import errors on unsupported platforms.
     """
     use_aiter_sparse_pa = minimax_m3_use_aiter_sparse_pa(
@@ -597,11 +606,9 @@ def select_main_backend_and_impl_cls(
             f"cache dtype, got {kv_cache_dtype}"
         )
     if use_nvfp4 and current_platform.is_rocm():
-        from vllm.platforms.rocm import on_gfx950
-
-        if not on_gfx950():
-            # The FlyDSL NVFP4 kernels are gfx950-only (MFMA); others use the
-            # portable Triton kernels over a token-major NVFP4 cache.
+        if not minimax_m3_rocm_flydsl_nvfp4():
+            # Elsewhere the portable Triton kernels over a token-major NVFP4
+            # cache.
             logger.info_once(
                 "MiniMax M3 sparse attention selected Triton NVFP4 (topk_blocks=%s)",
                 topk_blocks,
