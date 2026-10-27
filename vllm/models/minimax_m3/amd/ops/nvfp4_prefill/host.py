@@ -19,17 +19,28 @@ from .kernel import BLK, HG, TOPK, D
 
 
 @functools.cache
+def _arch_kernel():
+    from vllm.platforms.rocm import on_gfx1250
+
+    if on_gfx1250():
+        from . import kernel_gfx1250
+
+        return kernel_gfx1250
+    return _kernel
+
+
+@functools.cache
 def _get_kernel(rounds: int):
-    return _kernel.compile_nvfp4_prefill_fp16(rounds)
+    return _arch_kernel().compile_nvfp4_prefill_fp16(rounds)
 
 
 def supports_nvfp4_sparse_prefill(
     num_heads: int, num_kv_heads: int, head_dim: int, topk_blocks: int, block_size: int
 ) -> bool:
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
 
     return (
-        on_gfx950()
+        (on_gfx950() or on_gfx1250())
         and head_dim == D
         and num_heads == num_kv_heads * HG
         and topk_blocks == TOPK
@@ -78,7 +89,8 @@ def minimax_m3_nvfp4_sparse_prefill(
     vs = unit if v_scale is None else v_scale
     c = float(np.float32(sm_scale) * np.float32(LOG2E))
     # Up to one workgroup per CU the one-round combine is ~1 us faster.
-    n_wg = (n_tok + 3) // 4 * num_kv_heads
+    tok_per_wg = _arch_kernel().TOK_PER_WG
+    n_wg = (n_tok + tok_per_wg - 1) // tok_per_wg * num_kv_heads
     rounds = 2 if n_wg > cu_count(q.device) else 1
     run_compiled(
         _get_kernel(rounds),

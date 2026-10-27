@@ -83,7 +83,7 @@ def rocm_nvfp4_unsupported_reason(
         num_heads, num_kv_heads, head_dim, topk_blocks, block_size
     ):
         return (
-            "needs gfx950, head_dim 128, 16 query heads per KV head and 16 "
+            "needs gfx950 or gfx1250, head_dim 128, 16 query heads per KV head and 16 "
             f"selected 128-token blocks (got num_heads={num_heads}, "
             f"num_kv_heads={num_kv_heads}, head_dim={head_dim}, "
             f"topk_blocks={topk_blocks}, block_size={block_size})"

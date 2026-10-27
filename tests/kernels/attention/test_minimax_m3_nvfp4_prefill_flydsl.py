@@ -228,6 +228,7 @@ def test_fresh_prompt_calls_bitwise():
     assert torch.equal(full, torch.cat([run(0, 1024), run(1024, 3072), run(3072, n)]))
 
 
+@pytest.mark.skipif(not on_gfx950(), reason="MI355X MFMA erratum; MFMA spinner")
 @pytest.mark.parametrize("n_tok, ctx", [(1024, 31024), (4096, 64096)])
 def test_bitwise_next_to_mfma_waves(n_tok, ctx):
     """Another kernel's MFMA waves on every CU leave the output unchanged
