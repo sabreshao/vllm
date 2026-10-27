@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MiniMax-M3 index top-k (FlyDSL) against AITER's ``pa_sparse_block_topk``
-block ids, bit for bit, on realistic and adversarial decode and prefill rows."""
+block ids (gfx950) or a torch rendering of its order (gfx1250), bit for bit, on
+realistic and adversarial decode and prefill rows."""
 
 import math
 
@@ -11,12 +12,12 @@ import torch
 from vllm.platforms import current_platform
 
 if not current_platform.is_rocm():
-    pytest.skip("ROCm (gfx950) FlyDSL kernels", allow_module_level=True)
+    pytest.skip("ROCm (gfx950/gfx1250) FlyDSL kernels", allow_module_level=True)
 
-from vllm.platforms.rocm import on_gfx950  # noqa: E402
+from vllm.platforms.rocm import on_gfx950, on_gfx1250  # noqa: E402
 
-if not on_gfx950():
-    pytest.skip("gfx950 instructions", allow_module_level=True)
+if not (on_gfx950() or on_gfx1250()):
+    pytest.skip("gfx950 or gfx1250 instructions", allow_module_level=True)
 
 from vllm.models.minimax_m3.amd.ops.index_topk_decode.host import (  # noqa: E402
     minimax_m3_index_topk_decode_indices,
@@ -95,6 +96,48 @@ def _aiter_topk(score, bt, seq, msl, nkv, pad, **kw):
     return compared
 
 
+def _torch_topk(
+    score, bt, seq, msl, nkv, pad, *, query_len=1, num_valid_pages=None, **_
+):
+    """The block ids ``pa_sparse_block_topk`` returns, in its order, in torch.
+
+    AITER's HIP top-k assumes wave64 and drops blocks on gfx1250, so it is the
+    oracle only on gfx950. A row's live blocks are the first
+    ``min(ceil(kv_len / 128), walked width)``; each is ranked by the signed i64
+    ``key << 32 | block``, where ``key`` is the sign-folded float bits with NaNs
+    at the key of -inf (every NaN case here takes the exact search, which folds
+    them). Slot r holds the r-th largest; slots past the live count hold -1.
+    """
+    heads, rows, _ = score.shape
+    n = (msl + BLOCK * 64 - 1) // (BLOCK * 64)
+    cols = (1 << (n - 1).bit_length() if n >= 1 else 1) * 64
+    if num_valid_pages is not None:
+        nblk = num_valid_pages[:rows].long().cpu()
+    else:
+        tok = torch.arange(rows) % query_len
+        kv = seq.long().cpu().repeat_interleave(query_len) - query_len + tok + 1
+        nblk = (kv.clamp(min=0) + BLOCK - 1) // BLOCK
+    nlive = nblk.clamp(max=cols)
+    bits = score[..., :cols].cpu().contiguous().view(torch.int32).long()
+    key = bits ^ ((bits >> 31) & 0x7FFFFFFF)
+    neg_inf_key = -(1 << 31) + 0x007FFFFF  # (0xFF800000 ^ 0x7FFFFFFF) as i32
+    key = torch.where((key > 0x7F800000) | (key < neg_inf_key), neg_inf_key, key)
+    idx = torch.arange(cols)
+    comp = (key << 32) | idx
+    live = idx[None, None, :] < nlive[None, :, None]
+    comp = torch.where(live, comp, torch.iinfo(torch.int64).min)
+    ids = (comp.topk(16, dim=-1).values & 0xFFFFFFFF).int()
+    slot = torch.arange(16)[None, None, :]
+    ids = torch.where(slot < nlive.clamp(max=16)[None, :, None], ids, -1)
+    topk, compared = _topk_out(heads, rows, pad)
+    topk.copy_(ids.cuda())
+    return compared
+
+
+# gfx950's kernel matches AITER bit for bit; gfx1250 checks the torch rendering.
+_oracle_topk = _aiter_topk if on_gfx950() else _torch_topk
+
+
 SHAPES = [
     # reqs, query_len, max_seq_len, (lo, hi) seq_len, num_kv_heads, index heads
     (40, 4, 1 << 20, (30000, 210000), 1, 1),  # the QPS decode batch
@@ -138,7 +181,7 @@ def _check_decode(kind, shape, pad=False):
     cols = max(1, math.ceil(max(msl, int(seq.max())) / BLOCK))
     bt = torch.randint(0, 1 << 22, (reqs, cols), generator=gen).int().cuda()
     score, seq = score.cuda(), seq.int().cuda()
-    ref = _aiter_topk(score, bt, seq, msl, nkv, pad, query_len=ql)
+    ref = _oracle_topk(score, bt, seq, msl, nkv, pad, query_len=ql)
     topk, got = _topk_out(heads, reqs * ql, pad)
     minimax_m3_index_topk_decode_indices(
         score, topk, seq, max_seq_len=msl, query_len=ql
@@ -164,7 +207,7 @@ def test_index_topk_decode_all_padding():
     score = torch.randn(1, reqs * ql, _width(msl), device="cuda")
     bt = torch.zeros(reqs, msl // BLOCK, dtype=torch.int32, device="cuda")
     seq = torch.zeros(reqs, dtype=torch.int32, device="cuda")
-    ref = _aiter_topk(score, bt, seq, msl, 1, False, query_len=ql)
+    ref = _oracle_topk(score, bt, seq, msl, 1, False, query_len=ql)
     topk, _ = _topk_out(1, reqs * ql, False)
     minimax_m3_index_topk_decode_indices(
         score, topk, seq, max_seq_len=msl, query_len=ql
@@ -200,7 +243,7 @@ def _check_prefill(kind, shape, pad=False):
     cols = max(1, math.ceil(max(msl, int(seq.max())) / BLOCK))
     bt = torch.randint(0, 1 << 22, (len(reqs), cols), generator=gen).int().cuda()
     nvp, rid, kvl = (x.int().cuda() for x in (nvp, rid, pos + 1))
-    ref = _aiter_topk(
+    ref = _oracle_topk(
         score, bt, seq.int().cuda(), msl, nkv, pad,
         num_valid_pages=nvp, row_req_id=rid, kv_lens=kvl,
     )  # fmt: skip
