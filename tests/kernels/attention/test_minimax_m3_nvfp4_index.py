@@ -10,12 +10,12 @@ import torch
 from vllm.platforms import current_platform
 
 if not current_platform.is_rocm():
-    pytest.skip("ROCm (gfx950) FlyDSL kernels", allow_module_level=True)
+    pytest.skip("ROCm (gfx950/gfx1250) FlyDSL kernels", allow_module_level=True)
 
-from vllm.platforms.rocm import on_gfx950  # noqa: E402
+from vllm.platforms.rocm import on_gfx950, on_gfx1250  # noqa: E402
 
-if not on_gfx950():
-    pytest.skip("gfx950 instructions", allow_module_level=True)
+if not (on_gfx950() or on_gfx1250()):
+    pytest.skip("gfx950 or gfx1250 instructions", allow_module_level=True)
 
 from tests.kernels.attention.minimax_m3_nvfp4_ref import dequant  # noqa: E402
 from vllm.models.minimax_m3.amd.ops.nvfp4_index_decode import (  # noqa: E402
@@ -30,6 +30,10 @@ from vllm.models.minimax_m3.amd.ops.nvfp4_index_prefill import (  # noqa: E402
 
 minimax_m3_nvfp4_index_score_decode = decode_host.minimax_m3_nvfp4_index_score_decode
 minimax_m3_nvfp4_index_score_prefill = prefill_host.minimax_m3_nvfp4_index_score_prefill
+
+# AITER's HIP scorers assume wave64 and return wrong blocks on gfx1250; the
+# context-parallel push (TP4) is not ported to gfx1250.
+gfx950_only = pytest.mark.skipif(not on_gfx950(), reason="gfx950-only path or oracle")
 
 BLOCK = 128
 D = 128
@@ -123,6 +127,7 @@ def _check_decode(actual, q, keys, table, lens, query_len, init_blocks, local_bl
         _assert_scores(actual[:, sl, :nb], want, (r, s))
 
 
+@gfx950_only
 @pytest.mark.parametrize(
     ("num_heads", "query_len"),
     [(1, 1), (1, 4), (1, 16), (2, 4), (4, 1), (4, 4), (4, 5), (4, 8)],
@@ -290,6 +295,7 @@ def _check_cp_push(lens, page_step, init_blocks, local_blocks, grid):
     assert torch.equal(seen, (~expected.isnan()).int())
 
 
+@gfx950_only
 @pytest.mark.parametrize("num_reqs", [1, 5, 17, 45])
 @pytest.mark.parametrize("page_step", [1, 2])
 @pytest.mark.parametrize(("init_blocks", "local_blocks"), [(1, 2), (0, 1)])
@@ -302,6 +308,7 @@ def test_index_decode_cp_push_matches_single_head(
     _check_cp_push(_lens(num_reqs, 9000), page_step, init_blocks, local_blocks, grid)
 
 
+@gfx950_only
 @pytest.mark.parametrize("grid", [3, 768])
 def test_index_decode_cp_push_all_padding(grid):
     """Padding requests only (graph capture): nothing written."""
@@ -327,6 +334,7 @@ def _causal_blocks(q_len, s, num_heads):
     return row_pos, seen[None].expand(num_heads, -1, -1)
 
 
+@gfx950_only
 @pytest.mark.parametrize("num_heads", [1, 2, 4])
 @pytest.mark.parametrize(
     ("q_lens", "seq_lens_list"),
@@ -381,8 +389,8 @@ def test_index_prefill_matches_reference(
     q_lens, seq_lens_list, init_blocks, local_blocks, num_heads, monkeypatch
 ):
     """Every kernel the host can pick (``kernel_shared.py`` with 128- and
-    256-row tiles, ``kernel.py``) bit for bit alike, and against an fp32
-    reference."""
+    256-row tiles, ``kernel.py``; gfx1250 only the latter) bit for bit alike,
+    and against an fp32 reference."""
     table, seq_lens, cu, cache, q = _prefill_case(
         q_lens, seq_lens_list, num_heads, page_step=2 if num_heads == 2 else 1
     )
@@ -397,7 +405,8 @@ def test_index_prefill_matches_reference(
         minimax_m3_nvfp4_index_score_prefill(q, cache, out, *args)
         return out
 
-    variants = [(True, 1), (True, 2), (False, None)]
+    # gfx1250 has only the main scorer (``kernel_shared.py`` is gfx950-only).
+    variants = [(True, 1), (True, 2), (False, None)] if on_gfx950() else [(False, None)]
     outs = [run(*v) for v in variants]
     keys = _fp8_keys(cache).float()
     torch.accelerator.synchronize()

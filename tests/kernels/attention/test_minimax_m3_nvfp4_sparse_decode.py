@@ -11,10 +11,10 @@ from vllm.platforms import current_platform
 if not current_platform.is_rocm():
     pytest.skip("ROCm (gfx950) FlyDSL kernel", allow_module_level=True)
 
-from vllm.platforms.rocm import on_gfx950  # noqa: E402
+from vllm.platforms.rocm import on_gfx950, on_gfx1250  # noqa: E402
 
-if not on_gfx950():
-    pytest.skip("gfx950 instructions", allow_module_level=True)
+if not (on_gfx950() or on_gfx1250()):
+    pytest.skip("gfx950 or gfx1250 instructions", allow_module_level=True)
 
 from tests.kernels.attention.minimax_m3_nvfp4_ref import (  # noqa: E402
     dequant,
