@@ -39,8 +39,19 @@ def _unit(max_blocks: int, slots: int, umax: int, footprint: int) -> int:
 
 
 @functools.cache
+def _arch_kernel():
+    from vllm.platforms.rocm import on_gfx1250
+
+    if on_gfx1250():
+        from . import kernel_gfx1250
+
+        return kernel_gfx1250
+    return _kernel
+
+
+@functools.cache
 def _get_kernel(rows: int, heads: int, buffered: bool):
-    return _kernel.compile_score_decode(rows, heads, buffered)
+    return _arch_kernel().compile_score_decode(rows, heads, buffered)
 
 
 def _supported(
@@ -51,11 +62,11 @@ def _supported(
     seq_lens: torch.Tensor,
     query_len: int,
 ) -> bool:
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
 
     num_heads = q_idx.shape[1]
     return (
-        on_gfx950()
+        (on_gfx950() or on_gfx1250())
         and num_heads in (1, 2, 4)
         and 1 <= num_heads * query_len <= _kernel.MAX_ROWS
         and q_idx.dtype == torch.float8_e4m3fn
@@ -96,33 +107,34 @@ def minimax_m3_nvfp4_index_score_decode(
         return
     assert _supported(q_idx, index_cache, score, block_table, seq_lens, query_len)
     rows = num_heads * query_len
-    max_blocks = max(1, cdiv(max_seq_len, _kernel.BLK))
+    kernel = _arch_kernel()
+    max_blocks = max(1, cdiv(max_seq_len, kernel.BLK))
     # A chunk of NW x (pages per wave) requests; with at most one page per
     # wave, chunks of one request and each wave on its own positions.
     pages_per_wave = cdiv(num_reqs * max_blocks, TARGET_WAVES)
     s_bytes = _end_bytes(score)
     assert s_bytes < 2**31 * 4, "score offsets must fit in int32 elements"
     footprint = num_reqs * rows * max_blocks * 4
-    chunk = 1 if pages_per_wave <= 1 else _kernel.NW * pages_per_wave
-    chunk_cap = _kernel.chunk_max(_kernel.padded_rows(rows))
+    chunk = 1 if pages_per_wave <= 1 else kernel.NW * pages_per_wave
+    chunk_cap = kernel.chunk_max(kernel.padded_rows(rows))
     chunk = max(1, min(chunk, chunk_cap, num_reqs))
     nch = cdiv(num_reqs, chunk)
     chunk = cdiv(num_reqs, nch)
-    per_wave = chunk < _kernel.NW
-    wanted = max(1, TARGET_WAVES // (_kernel.NW * nch))
+    per_wave = chunk < kernel.NW
+    wanted = max(1, TARGET_WAVES // (kernel.NW * nch))
     # Past 16 rows the buffered variant's flush costs more than it saves.
     unit = (
         _unit(
             max_blocks,
-            wanted * (_kernel.NW if per_wave else 1),
-            _kernel.UMAX,
+            wanted * (kernel.NW if per_wave else 1),
+            kernel.UMAX,
             footprint,
         )
-        if _kernel.padded_rows(rows) <= 16
+        if kernel.padded_rows(rows) <= 16
         else 0
     )
     units = cdiv(max_blocks, max(1, unit))
-    positions = cdiv(units, _kernel.NW) if per_wave else units
+    positions = cdiv(units, kernel.NW) if per_wave else units
     splits = max(1, min(positions, wanted))
     run_compiled(
         _get_kernel(rows, num_heads, unit > 0),
@@ -150,8 +162,12 @@ def minimax_m3_nvfp4_index_score_decode(
         int(per_wave),
         int(unit),
         torch.cuda.current_stream(),
-        # Keep the buffered variant at the plain one's occupancy.
-        waves_per_eu=3 if unit > 0 and _kernel.padded_rows(rows) <= 16 else None,
+        # Keep the buffered variant at the plain one's occupancy (gfx950).
+        waves_per_eu=(
+            3
+            if kernel is _kernel and unit > 0 and kernel.padded_rows(rows) <= 16
+            else None
+        ),
     )
 
 
