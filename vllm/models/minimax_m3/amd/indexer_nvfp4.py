@@ -46,10 +46,10 @@ def rocm_nvfp4_indexer_unsupported_reason(
     """Why the ROCm NVFP4 indexer cannot serve this config, None when it can."""
     if not current_platform.is_rocm():
         return "needs ROCm"
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
 
-    if not on_gfx950():
-        return "needs gfx950"
+    if not (on_gfx950() or on_gfx1250()):
+        return "needs gfx950 or gfx1250"
     if (topk_blocks, sparse_block_size, index_head_dim, score_type) != (
         MSA_TOPK_BLOCKS,
         MSA_SPARSE_BLOCK_SIZE,
