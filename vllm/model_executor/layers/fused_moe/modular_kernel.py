@@ -424,7 +424,7 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
         topk_ids: torch.Tensor,
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: TopKWeightAndReduce,
-    ) -> None:
+    ) -> torch.Tensor | None:
         """Perform any combine plus apply weights and perform a reduction on the
         fused experts output.
         - output: The output tensor, written in place.  Must be (M, K) shape.
@@ -436,6 +436,11 @@ class FusedMoEPrepareAndFinalizeModular(FusedMoEPrepareAndFinalize):
           fused_expert_output.
         - weight_and_reduce_impl: An optional TopKWeightAndReduce
           implementation.
+
+        An implementation whose combine lands in a buffer of its own may return
+        that (M, K) tensor instead of copying it into `output`; it then stands
+        in for `output` and must stay valid until the next MoE layer's
+        finalize (the caller consumes it before that, in stream order).
         """
         raise NotImplementedError
 
@@ -1544,7 +1549,7 @@ class FusedMoEKernelModularImpl:
         if not self.prepare_finalize.supports_async():
             assert not dbo_enabled() or self.prepare_finalize.supports_dbo()
 
-            self.prepare_finalize.finalize(
+            finalized = self.prepare_finalize.finalize(
                 output,
                 fused_out,
                 topk_weights,
@@ -1552,6 +1557,8 @@ class FusedMoEKernelModularImpl:
                 apply_router_weight_on_input,
                 self.fused_experts.finalize_weight_and_reduce_impl(),
             )
+            if finalized is not None:
+                return finalized
         else:
             finalize_ret = self.prepare_finalize.finalize_async(
                 output,
