@@ -106,6 +106,8 @@ def compile_score_prefill(heads: int = 1):
                 lut_g = global_i32_ptr(arg_lut)
                 for e in range_constexpr(512 // NTH):
                     smem.lut.ptr[tx + e * NTH] = fx.Int32(lut_g[tx + e * NTH])
+                # Every thread's dequant reads table entries other waves wrote.
+                fx.gpu.barrier()
 
                 # Rows past q_len * H read the next request's Q and are masked at
                 # the store. Q^T per (N-tile, K step) as 8 dwords of bf16.
