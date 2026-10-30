@@ -43,6 +43,17 @@ M31_TP4_SHAPES = [
     ("shared_down", 6144, 768),
 ]
 
+# MiniMax-M3.1-Flash at TP=1 (gfx1250 prefill tuning): fused q|k|v|index_q|index_k,
+# o_proj, shared-expert gate_up/down, dense-MLP gate_up/down.
+M31_TP1_SHAPES = [
+    ("fused_qkv_index", 9856, 6144),
+    ("o_proj", 6144, 8192),
+    ("shared_gate_up", 6144, 6144),
+    ("shared_down", 6144, 3072),
+    ("dense_gate_up", 24576, 6144),
+    ("dense_down", 6144, 12288),
+]
+
 
 def _make_layer(n: int, k: int, device: str) -> torch.nn.Module:
     weight_bf16 = torch.randn(n, k, device=device, dtype=torch.bfloat16) * 0.05
@@ -85,14 +96,39 @@ def test_rocm_mxfp8_linear_preserves_non_gfx950_tiles(monkeypatch, n, k, fallbac
     from vllm.model_executor.kernels.linear.mxfp8 import rocm_native
 
     monkeypatch.setattr(rocm_native, "_ON_GFX950", False)
+    monkeypatch.setattr(rocm_native, "_ON_GFX1250", False)
     for num_tokens in (1, 8, 16, 17):
         assert rocm_native._select_cfg(num_tokens, n, k) == fallback
 
 
+@pytest.mark.parametrize("name,n,k", M31_TP1_SHAPES, ids=lambda v: str(v))
+def test_rocm_mxfp8_linear_selects_gfx1250_prefill_tiles(monkeypatch, name, n, k):
+    """gfx1250 prefill (M >= 2048) uses the MI455X-tuned 4-warp tiles; smaller M
+    keeps the shared selection."""
+    from vllm.model_executor.kernels.linear.mxfp8 import rocm_native
+
+    monkeypatch.setattr(rocm_native, "_ON_GFX950", False)
+    monkeypatch.setattr(rocm_native, "_ON_GFX1250", True)
+    for num_tokens in (2048, 5664, 8191):
+        assert rocm_native._select_cfg(num_tokens, n, k) == (128, 128, 256, 4, 1)
+    for num_tokens in (8192, 14832, 32768):
+        assert rocm_native._select_cfg(num_tokens, n, k) == (256, 256, 128, 4, 2)
+    monkeypatch.setattr(rocm_native, "_ON_GFX1250", False)
+    gfx1250_small = rocm_native._select_cfg(1024, n, k)
+    monkeypatch.setattr(rocm_native, "_ON_GFX1250", True)
+    assert rocm_native._select_cfg(1024, n, k) == gfx1250_small
+
+
 @pytest.mark.parametrize(
-    "name,n,k", V41_ATTN_SHAPES + M31_TP4_SHAPES, ids=lambda v: str(v)
+    "name,n,k,num_tokens",
+    [
+        (name, n, k, m)
+        for name, n, k in V41_ATTN_SHAPES + M31_TP4_SHAPES
+        for m in (1, 2, 7, 8, 16, 31, 32, 128, 1024)
+    ]
+    + [(name, n, k, m) for name, n, k in M31_TP1_SHAPES for m in (2048, 8192)],
+    ids=lambda v: str(v),
 )
-@pytest.mark.parametrize("num_tokens", [1, 2, 7, 8, 16, 31, 32, 128, 1024])
 @torch.inference_mode()
 def test_rocm_mxfp8_linear_matches_dequant_reference(name, n, k, num_tokens):
     """Output is finite and matches an exact MXFP8 GEMM of the same inputs.

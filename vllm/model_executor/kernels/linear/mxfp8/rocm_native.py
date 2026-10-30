@@ -135,10 +135,12 @@ def _mxfp8_dot_scaled_gemm(
 # room for num_stages=3 at BLOCK_K=256; use 2 there.
 _BK256_STAGES = 3
 _ON_GFX950 = False
+_ON_GFX1250 = False
 if current_platform.is_rocm():
-    from vllm.platforms.rocm import on_gfx950
+    from vllm.platforms.rocm import on_gfx950, on_gfx1250
 
     _ON_GFX950 = on_gfx950()
+    _ON_GFX1250 = on_gfx1250()
     if _ON_GFX950:
         _BK256_STAGES = 2
 
@@ -154,6 +156,12 @@ def _select_cfg(M, N, K):
     (the K-loop is unmasked), so every BLOCK_K below is guarded to be K-divisible
     (served K: 384/768/1024/2048/6144).
     """
+    if _ON_GFX1250 and M >= 2048 and K >= 2048 and K % 256 == 0:
+        # gfx1250 (MI455X, wave32 WMMA) prefill, graph-tuned for MiniMax-M3.1 TP=1
+        # (N x K = 9856x6144, 6144x8192, 6144x6144, 6144x3072, 24576x6144,
+        # 6144x12288; M = 2048..32768): 4 warps and shallow pipelines run ~2.2x
+        # faster than the gfx950 8-warp tiles below (~0.8 -> ~1.8 PFLOP/s).
+        return (128, 128, 256, 4, 1) if M < 8192 else (256, 256, 128, 4, 2)
     if _ON_GFX950 and M <= 16:
         if K == 6144 and N in (1536, 2560):
             return 16, 16, 1024, 2, 3
