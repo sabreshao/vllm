@@ -110,6 +110,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     is_full_attention_spec,
 )
@@ -633,8 +634,10 @@ class MoRIIOConnectorScheduler:
                     f"cache group spec(s): {sorted(set(unsupported))}. Pass "
                     "--disable-hybrid-kv-cache-manager to run without HMA."
                 )
+            # SlidingWindowMLASpec slots are MLA latents — WRITE handles them.
             if self.mode == MoRIIOMode.WRITE and any(
                 isinstance(g.kv_cache_spec, SlidingWindowSpec)
+                and not isinstance(g.kv_cache_spec, SlidingWindowMLASpec)
                 for g in kv_cache_config.transfer_groups
             ):
                 raise NotImplementedError(
@@ -1235,7 +1238,7 @@ class MoRIIOConnectorScheduler:
                             )
 
                     block_notify_list: list[int] | list[list[int]]
-                    if self._has_mamba:
+                    if self._has_mamba or self._is_hma_required:
                         block_notify_list = list(
                             self._clamp_to_prompt_blocks(
                                 request, blocks.get_block_ids()
