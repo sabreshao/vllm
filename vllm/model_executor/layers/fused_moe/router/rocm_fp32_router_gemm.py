@@ -184,8 +184,17 @@ def rocm_fp32_router_gemm(
 # Mid-M BF16 router GEMM (32 < M <= _MAX_MFMA_TOKENS). hipBLASLt takes ~8.6 us
 # for [64, 5120] x [5120, 384] on MI355X (cold weight, graph replay); this
 # MFMA split-K kernel, with the in-launch ordered split reduction of the
-# block32 GEMM, takes ~5.8 us.
-_MAX_MFMA_TOKENS = 128
+# block32 GEMM, takes ~5.8 us. Up to M = 512 (DP8 DSpark decode: 64-128
+# requests x 4-6 tokens per rank) it also beats hipBLASLt: 10.5 -> 7.2 us at
+# M = 256, 13.6 -> 9.9 us at M = 384, 12.8 -> 11.1 us at M = 512.
+_MAX_MFMA_TOKENS = 512
+# (max M, (BLOCK_M, BLOCK_N, BLOCK_K, splits, warps, stages)) above M = 128,
+# swept on MI355X at M = 192, 256, 320, 384, 512 (N = 384, K = 5120).
+_LARGE_M_TIERS = (
+    (192, (64, 16, 128, 5, 4, 3)),
+    (320, (64, 32, 128, 4, 4, 3)),
+    (512, (64, 64, 128, 5, 4, 3)),
+)
 
 
 @triton.jit
@@ -256,7 +265,7 @@ def rocm_bf16_router_gemm_splitk(
     hidden_states: torch.Tensor,
     router_weight: torch.Tensor,
 ) -> torch.Tensor:
-    """`hidden_states @ router_weight.T` in fp32 for 32 < M <= 128 (gfx950).
+    """`hidden_states @ router_weight.T` in fp32 for 32 < M <= 512 (gfx950).
 
     Deterministic: split-K partials are summed in split order by the last
     program of each output tile.
@@ -267,9 +276,14 @@ def rocm_bf16_router_gemm_splitk(
     counters = _split_counters(out.device)
     if counters is None:
         return torch.mm(hidden_states, router_weight.T, out_dtype=torch.float32)
-    block_m = 64 if M <= 64 else 128
-    # (BLOCK_N, BLOCK_K, splits, warps, stages), swept on MI355X at M=64.
-    block_n, block_k, splits, warps, stages = 16, 256, 10, 4, 2
+    if M <= 128:
+        block_m = 64 if M <= 64 else 128
+        # (BLOCK_N, BLOCK_K, splits, warps, stages), swept on MI355X at M=64.
+        block_n, block_k, splits, warps, stages = 16, 256, 10, 4, 2
+    else:
+        block_m, block_n, block_k, splits, warps, stages = next(
+            cfg for max_m, cfg in _LARGE_M_TIERS if max_m >= M
+        )
     k_per_split = K // splits
     tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
     slots = torch.empty(
