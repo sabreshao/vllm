@@ -103,6 +103,65 @@ def _sum_splits(
         tl.store(count_ptr, 0)
 
 
+@triton.jit
+def _step_scales(
+    ptr,
+    rows,
+    col0,
+    step,
+    STEPS: tl.constexpr,
+    STRIDE: tl.constexpr,
+    BKS: tl.constexpr,
+    KS: tl.constexpr,
+    EVEN: tl.constexpr,
+):
+    """E8M0 scales of K step `step` as [len(rows), BKS] uint8 from a
+    [*, KS] byte matrix in which row `rows[r]` reads the BKS bytes starting
+    at byte `(col0[r] + j * STRIDE) * BKS` in step j < STEPS.
+
+    The scales are read as whole words with loads that do not depend on
+    `step`, so the compiler hoists all STEPS of them above the K loop; the
+    step's word is picked by a `where` chain on the loop index and split into
+    bytes by shifts. Loading the scales inside the loop instead issues a VGPR
+    load behind each tile prefetch whose wait drains the prefetch, so
+    `num_stages > 2` cannot pipeline.
+
+    The loads are unmasked (a masked load becomes a branch per word): callers
+    clamp `rows` into the matrix, and unless EVEN promises every step is in
+    range, steps past the end re-read the last word. Either way those scales
+    only meet zero-filled operands.
+    """
+    # BKS >= 4 (BLOCK_K >= 128): 32-bit words, or 64-bit words from BKS 8 up.
+    WB: tl.constexpr = 8 if BKS > 8 else BKS
+    NW: tl.constexpr = BKS // WB
+    if WB == 4:
+        p = ptr.to(tl.pointer_type(tl.int32))
+    else:
+        p = ptr.to(tl.pointer_type(tl.int64))
+    ROW_WORDS: tl.constexpr = KS // WB
+    if NW == 1:
+        cols = col0
+    else:
+        cols = col0[:, None] * NW + tl.arange(0, NW)[None, :]
+        rows = rows[:, None]
+    if not EVEN:
+        cols = tl.minimum(cols, ROW_WORDS - 1)
+    word = tl.load(p + rows * ROW_WORDS + cols)
+    for j in tl.static_range(1, STEPS):
+        if EVEN:
+            cj = cols + j * STRIDE * NW
+        else:
+            cj = tl.minimum(cols + j * STRIDE * NW, ROW_WORDS - 1)
+        word = tl.where(step == j, tl.load(p + rows * ROW_WORDS + cj), word)
+    sh = (tl.arange(0, WB) * 8).to(word.dtype)
+    if NW == 1:
+        b = ((word[:, None] >> sh[None, :]) & 0xFF).to(tl.uint8)
+    else:
+        b = ((word[:, :, None] >> sh[None, None, :]) & 0xFF).to(tl.uint8)
+        b = b.reshape(b.shape[0], BKS)
+    return b
+
+
 @triton.jit(do_not_specialize=["M"])
 def _block32_tiled_kernel(
     x_ptr,
@@ -123,6 +182,7 @@ def _block32_tiled_kernel(
     N_FIRST: tl.constexpr,
     EVEN_K: tl.constexpr,
     FUSED_SPLITS: tl.constexpr,
+    HOIST_SCALES: tl.constexpr = False,
 ):
     if FUSED_SPLITS > 1:
         pid_m, pid_n, tile, pid_k = _split_tile(N, BLOCK_N, FUSED_SPLITS)
@@ -148,8 +208,17 @@ def _block32_tiled_kernel(
     w_ptrs = w_ptr + offs_n[:, None] * K + offs_k[None, :]
     ws_ptrs = ws_ptr + (offs_n[:, None] // 32) * (K // 32) + offs_sk[None, :]
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    STEPS: tl.constexpr = K_PER_SPLIT // BLOCK_K
     for kk in range(0, K_PER_SPLIT, BLOCK_K):
-        if EVEN_K:
+        if HOIST_SCALES:
+            if EVEN_K:
+                x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+                w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
+            else:
+                k_ok = (offs_k + kk) < K
+                x = tl.load(x_ptrs, mask=m_mask[:, None] & k_ok[None, :], other=0.0)
+                w = tl.load(w_ptrs, mask=n_mask[:, None] & k_ok[None, :], other=0.0)
+        elif EVEN_K:
             x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
             xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=0)
             w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
@@ -161,6 +230,31 @@ def _block32_tiled_kernel(
             xs = tl.load(xs_ptrs, mask=m_mask[:, None] & s_ok[None, :], other=0)
             w = tl.load(w_ptrs, mask=n_mask[:, None] & k_ok[None, :], other=0.0)
             ws = tl.load(ws_ptrs, mask=n_mask[:, None] & s_ok[None, :], other=0)
+        if HOIST_SCALES:
+            # Requires K % BLOCK_K == 0, so a step's scales are whole words.
+            step = kk // BLOCK_K
+            xs = _step_scales(
+                xs_ptr,
+                tl.minimum(offs_m, M - 1),
+                offs_m * 0 + k0 // BLOCK_K,
+                step,
+                STEPS,
+                1,
+                BLOCK_K // 32,
+                K // 32,
+                EVEN_K,
+            )
+            ws = _step_scales(
+                ws_ptr,
+                tl.minimum(offs_n, N - 1) // 32,
+                offs_n * 0 + k0 // BLOCK_K,
+                step,
+                STEPS,
+                1,
+                BLOCK_K // 32,
+                K // 32,
+                EVEN_K,
+            )
         acc = tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3", acc=acc)
         x_ptrs += BLOCK_K
         w_ptrs += BLOCK_K
@@ -204,6 +298,7 @@ def _block32_packed_kernel(
     K_PER_SPLIT: tl.constexpr,
     EVEN_K: tl.constexpr,
     FUSED_SPLITS: tl.constexpr,
+    HOIST_SCALES: tl.constexpr = False,
 ):
     if FUSED_SPLITS > 1:
         pid_m, pid_n, tile, pid_k = _split_tile(N, BLOCK_N, FUSED_SPLITS)
@@ -230,26 +325,62 @@ def _block32_packed_kernel(
     row_ok = rows < M
     col_ok = cols < N
     acc = tl.zeros((BLOCK_M * K_PACK, BLOCK_N * K_PACK), dtype=tl.float32)
-    for base in range(k_start, k_stop, BLOCK_K * K_PACK):
+    STEP: tl.constexpr = BLOCK_K * K_PACK
+    STEPS: tl.constexpr = K_PER_SPLIT // STEP
+    for base in range(k_start, k_stop, STEP):
         xk = base + x_panel[:, None] * BLOCK_K + ks[None, :]
         wk = base + w_panel[:, None] * BLOCK_K + ks[None, :]
-        xg = base // 32 + x_panel[:, None] * (BLOCK_K // 32) + gs[None, :]
-        wg = base // 32 + w_panel[:, None] * (BLOCK_K // 32) + gs[None, :]
         x_mask = row_ok[:, None]
         w_mask = col_ok[:, None]
-        xs_mask = row_ok[:, None]
-        ws_mask = col_ok[:, None]
-        if not EVEN_K:
-            x_mask = x_mask & (xk < K)
-            w_mask = w_mask & (wk < K)
-            xs_mask = xs_mask & (xg < K // 32)
-            ws_mask = ws_mask & (wg < K // 32)
-        x = tl.load(x_ptr + rows[:, None] * K + xk, mask=x_mask, other=0.0)
-        w = tl.load(w_ptr + cols[:, None] * K + wk, mask=w_mask, other=0.0)
-        xs = tl.load(xs_ptr + rows[:, None] * (K // 32) + xg, mask=xs_mask, other=0)
-        ws = tl.load(
-            ws_ptr + (cols[:, None] // 32) * (K // 32) + wg, mask=ws_mask, other=0
-        )
+        if HOIST_SCALES:
+            if not EVEN_K:
+                x_mask = x_mask & (xk < K)
+                w_mask = w_mask & (wk < K)
+            x = tl.load(x_ptr + rows[:, None] * K + xk, mask=x_mask, other=0.0)
+            w = tl.load(w_ptr + cols[:, None] * K + wk, mask=w_mask, other=0.0)
+            # Requires K % BLOCK_K == 0. The last split may be short, so the
+            # word columns are always clamped.
+            step = (base - k_start) // STEP
+            xs = _step_scales(
+                xs_ptr,
+                tl.minimum(rows, M - 1),
+                k_start // BLOCK_K + x_panel,
+                step,
+                STEPS,
+                K_PACK,
+                BLOCK_K // 32,
+                K // 32,
+                False,
+            )
+            ws = _step_scales(
+                ws_ptr,
+                tl.minimum(cols, N - 1) // 32,
+                k_start // BLOCK_K + w_panel,
+                step,
+                STEPS,
+                K_PACK,
+                BLOCK_K // 32,
+                K // 32,
+                False,
+            )
+        else:
+            xg = base // 32 + x_panel[:, None] * (BLOCK_K // 32) + gs[None, :]
+            wg = base // 32 + w_panel[:, None] * (BLOCK_K // 32) + gs[None, :]
+            xs_mask = row_ok[:, None]
+            ws_mask = col_ok[:, None]
+            if not EVEN_K:
+                x_mask = x_mask & (xk < K)
+                w_mask = w_mask & (wk < K)
+                xs_mask = xs_mask & (xg < K // 32)
+                ws_mask = ws_mask & (wg < K // 32)
+            x = tl.load(x_ptr + rows[:, None] * K + xk, mask=x_mask, other=0.0)
+            w = tl.load(w_ptr + cols[:, None] * K + wk, mask=w_mask, other=0.0)
+            xs = tl.load(xs_ptr + rows[:, None] * (K // 32) + xg, mask=xs_mask, other=0)
+            ws = tl.load(
+                ws_ptr + (cols[:, None] // 32) * (K // 32) + wg,
+                mask=ws_mask,
+                other=0,
+            )
         acc = tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3", acc=acc)
     # Keep only products of matching K panels: the block diagonal.
     blocks = acc.reshape(BLOCK_M, K_PACK, BLOCK_N, K_PACK).trans(0, 2, 1, 3)
@@ -439,19 +570,45 @@ class _Config(NamedTuple):
     waves_per_eu: int
     # K partitions summed within the launch.
     fused_splits: int = 1
+    # Load each program's scales once before the K loop (_step_scales).
+    hoist: bool = False
 
 
 def _tiled(
-    bm, bn, bk, split_k, n_first, warps, stages, nonkdim, waves, fused=1
+    bm, bn, bk, split_k, n_first, warps, stages, nonkdim, waves, fused=1, hoist=0
 ) -> _Config:
     return _Config(
-        False, bm, bn, bk, split_k, bool(n_first), warps, stages, nonkdim, waves, fused
+        False,
+        bm,
+        bn,
+        bk,
+        split_k,
+        bool(n_first),
+        warps,
+        stages,
+        nonkdim,
+        waves,
+        fused,
+        bool(hoist),
     )
 
 
-def _packed(bm, bn, bk, k_pack, warps, stages, nonkdim, waves, fused=1) -> _Config:
+def _packed(
+    bm, bn, bk, k_pack, warps, stages, nonkdim, waves, fused=1, hoist=0
+) -> _Config:
     return _Config(
-        True, bm, bn, bk, k_pack, False, warps, stages, nonkdim, waves, fused
+        True,
+        bm,
+        bn,
+        bk,
+        k_pack,
+        False,
+        warps,
+        stages,
+        nonkdim,
+        waves,
+        fused,
+        bool(hoist),
     )
 
 
@@ -488,18 +645,18 @@ _TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
     ],
     # fused wq_a|wkv (replicated)
     (1792, 5120): [
-        (1, _packed(8, 16, 1024, 2, 2, 3, 16, 0)),
-        (8, _packed(8, 16, 1024, 2, 2, 3, 16, 1)),
+        (1, _packed(8, 16, 1024, 2, 2, 3, 16, 0, hoist=1)),
+        (8, _packed(8, 16, 1024, 2, 2, 3, 16, 1, hoist=1)),
         (16, _tiled(16, 64, 1024, 1, True, 4, 2, 16, 0, 5)),
         (32, _packed(16, 16, 1024, 1, 2, 3, 16, 1)),
         (48, _tiled(64, 32, 512, 1, True, 8, 2, 16, 0, 4)),
         (64, _tiled(64, 32, 512, 1, True, 8, 3, 16, 1, 4)),
-        (96, _tiled(64, 32, 512, 1, True, 8, 3, 16, 0, 2)),
+        (96, _tiled(64, 32, 512, 1, True, 8, 3, 16, 0, 2, hoist=1)),
         (128, _tiled(64, 32, 256, 1, True, 4, 3, 16, 0, 4)),
-        (192, _tiled(64, 32, 256, 1, True, 4, 3, 16, 0, 3)),
-        (256, _tiled(64, 64, 512, 1, True, 4, 2, 16, 1, 2)),
-        (384, _tiled(64, 64, 256, 1, True, 4, 2, 16, 0, 3)),
-        (512, _tiled(64, 64, 512, 1, True, 4, 2, 32, 1)),
+        (192, _tiled(128, 32, 256, 1, True, 4, 3, 32, 1, 2, hoist=1)),
+        (256, _tiled(64, 64, 256, 1, True, 4, 3, 32, 1, 2, hoist=1)),
+        (384, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0, 3, hoist=1)),
+        (512, _tiled(128, 64, 256, 1, True, 8, 3, 32, 0, 2, hoist=1)),
         (768, _tiled(128, 128, 256, 1, True, 4, 2, 16, 1, 2)),
         (1024, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0)),
         (2048, _tiled(128, 128, 256, 1, False, 4, 2, 32, 1)),
@@ -532,18 +689,18 @@ _TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
     ],
     # indexer wq_b
     (4096, 1280): [
-        (1, _packed(4, 16, 256, 4, 4, 2, 16, 1)),
-        (2, _packed(4, 16, 256, 4, 4, 2, 16, 0)),
-        (4, _packed(4, 16, 256, 4, 4, 2, 16, 1)),
+        (1, _packed(4, 16, 256, 4, 4, 3, 16, 1, hoist=1)),
+        (2, _packed(4, 16, 256, 4, 4, 3, 16, 0, hoist=1)),
+        (4, _packed(4, 16, 256, 4, 4, 3, 16, 1, hoist=1)),
         (8, _packed(8, 16, 256, 4, 4, 3, 16, 1)),
         (16, _packed(16, 16, 512, 2, 2, 3, 16, 1)),
         (32, _packed(32, 16, 1024, 1, 2, 3, 16, 1)),
         (64, _tiled(32, 32, 512, 1, True, 4, 3, 16, 1)),
         (128, _tiled(64, 32, 512, 1, True, 8, 3, 16, 0)),
-        (192, _tiled(64, 32, 256, 1, True, 4, 3, 16, 0)),
-        (256, _tiled(64, 64, 512, 1, True, 4, 2, 32, 1)),
-        (384, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0)),
-        (512, _tiled(128, 64, 256, 1, True, 8, 3, 32, 0)),
+        (192, _tiled(128, 32, 256, 1, True, 4, 3, 32, 1, hoist=1)),
+        (256, _tiled(64, 64, 256, 1, True, 4, 3, 32, 0, hoist=1)),
+        (384, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0, hoist=1)),
+        (512, _tiled(128, 64, 256, 1, True, 8, 3, 32, 1, hoist=1)),
         (1024, _tiled(128, 128, 256, 1, True, 4, 2, 32, 1)),
         (2048, _tiled(128, 128, 128, 1, True, 4, 2, 32, 0)),
         (3072, _tiled(128, 128, 128, 1, True, 8, 2, 32, 1)),
@@ -671,9 +828,9 @@ _TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
         (24, _packed(32, 32, 256, 1, 2, 3, 16, 0)),
         (64, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0)),
         (128, _tiled(128, 128, 256, 1, True, 8, 2, 32, 1)),
-        (192, _tiled(128, 128, 128, 1, True, 4, 2, 32, 0)),
+        (256, _tiled(256, 128, 128, 1, True, 8, 3, 32, 0, hoist=1)),
         (384, _tiled(128, 128, 128, 1, True, 8, 2, 32, 0)),
-        (512, _tiled(128, 128, 128, 1, True, 4, 2, 32, 0)),
+        (512, _tiled(128, 128, 128, 1, True, 4, 2, 32, 0, hoist=1)),
         (8192, _tiled(128, 128, 128, 1, True, 4, 2, 16, 0)),
     ],
     # wo_b, TP1
@@ -683,7 +840,7 @@ _TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
         (16, _packed(16, 32, 512, 1, 2, 2, 16, 0, 4)),
         (32, _packed(32, 32, 512, 1, 4, 2, 16, 0, 3)),
         (64, _tiled(64, 64, 512, 1, True, 4, 2, 16, 1, 3)),
-        (128, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0, 3)),
+        (128, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0, 3, hoist=1)),
         (192, _tiled(64, 64, 512, 1, True, 4, 2, 16, 1)),
         (256, _tiled(128, 128, 256, 1, True, 4, 2, 16, 1, 3)),
         (384, _tiled(128, 128, 256, 2, False, 4, 2, 16, 1, 2)),
@@ -696,13 +853,13 @@ _TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
         (2, _packed(8, 32, 256, 2, 4, 3, 16, 0, 8)),
         (8, _packed(8, 32, 256, 2, 4, 3, 16, 0, 6)),
         (16, _packed(16, 32, 512, 1, 2, 2, 16, 0, 6)),
-        (32, _tiled(32, 32, 256, 1, True, 4, 3, 16, 0, 5)),
-        (48, _tiled(64, 64, 256, 1, False, 4, 3, 32, 1, 3)),
+        (32, _tiled(32, 32, 256, 1, True, 4, 3, 16, 0, 5, hoist=1)),
+        (48, _tiled(64, 64, 256, 1, False, 4, 3, 32, 1, 3, hoist=1)),
         (64, _tiled(64, 64, 512, 1, True, 8, 2, 16, 0, 3)),
         (96, _tiled(32, 32, 512, 1, True, 4, 2, 16, 0)),
-        (128, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0, 3)),
-        (192, _tiled(64, 64, 512, 1, True, 4, 2, 32, 1)),
-        (256, _tiled(128, 128, 256, 1, True, 8, 2, 16, 0, 3)),
+        (128, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0, 3, hoist=1)),
+        (192, _tiled(64, 64, 512, 1, True, 4, 2, 32, 0, hoist=1)),
+        (256, _tiled(128, 128, 256, 1, True, 8, 2, 32, 1, 3, hoist=1)),
         (384, _tiled(128, 128, 256, 2, False, 4, 2, 16, 1, 2)),
         (512, _tiled(128, 128, 256, 1, True, 4, 2, 32, 1)),
         (8192, _tiled(128, 128, 128, 1, True, 4, 2, 16, 0)),
@@ -710,28 +867,28 @@ _TUNED: dict[tuple[int, int], list[tuple[int, _Config]]] = {
     # shared expert down, TP1
     (5120, 2304): [
         (1, _packed(16, 32, 1024, 1, 2, 3, 16, 1)),
-        (2, _packed(8, 32, 256, 2, 4, 3, 16, 0)),
+        (2, _packed(8, 32, 256, 2, 4, 3, 16, 0, hoist=1)),
         (4, _tiled(16, 32, 1024, 1, True, 2, 3, 16, 0)),
-        (8, _packed(8, 32, 256, 2, 4, 3, 16, 0)),
+        (8, _packed(8, 32, 256, 2, 4, 3, 16, 0, hoist=1)),
         (16, _tiled(16, 32, 1024, 1, True, 2, 3, 16, 0)),
         (32, _tiled(32, 32, 256, 1, True, 4, 3, 16, 0, 3)),
         (64, _tiled(64, 32, 256, 1, True, 8, 3, 16, 0, 4)),
         (96, _tiled(32, 32, 512, 1, True, 4, 2, 16, 0)),
-        (128, _tiled(64, 32, 256, 1, True, 8, 3, 16, 0)),
-        (192, _tiled(64, 64, 512, 1, True, 4, 2, 32, 1)),
-        (256, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0)),
-        (384, _tiled(128, 64, 256, 1, True, 8, 3, 32, 0)),
-        (512, _tiled(128, 128, 256, 1, True, 4, 2, 32, 1)),
+        (128, _tiled(64, 32, 256, 1, True, 8, 3, 16, 0, hoist=1)),
+        (192, _tiled(64, 64, 256, 1, True, 4, 3, 32, 0, hoist=1)),
+        (256, _tiled(128, 64, 256, 1, True, 8, 3, 32, 0, hoist=1)),
+        (384, _tiled(128, 64, 256, 1, True, 8, 3, 32, 1, hoist=1)),
+        (512, _tiled(128, 128, 256, 1, True, 4, 2, 32, 0, hoist=1)),
         (8192, _tiled(128, 128, 128, 1, True, 4, 2, 16, 0)),
     ],
     # engram wkv
     (25600, 6144): [
         (2, _packed(4, 16, 256, 4, 4, 2, 16, 0, 5)),
-        (4, _packed(4, 16, 256, 4, 4, 2, 16, 0, 4)),
-        (8, _packed(8, 32, 256, 4, 2, 3, 16, 0, 3)),
+        (4, _packed(4, 16, 256, 4, 4, 3, 16, 0, 4, hoist=1)),
+        (8, _packed(8, 32, 256, 4, 2, 3, 16, 0, 3, hoist=1)),
         (16, _tiled(16, 64, 1024, 1, True, 4, 2, 16, 0, 8)),
         (24, _tiled(64, 64, 256, 1, True, 4, 2, 16, 0)),
-        (32, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0)),
+        (32, _tiled(64, 64, 256, 1, True, 4, 2, 32, 0, hoist=1)),
         (48, _tiled(64, 64, 256, 1, True, 4, 2, 16, 0)),
         (64, _tiled(128, 128, 256, 1, True, 4, 2, 32, 0)),
         (96, _tiled(128, 128, 256, 1, False, 4, 2, 32, 0)),
@@ -895,6 +1052,19 @@ def _launch(
     else:
         args = (x, x_scale, weight, weight_scale, target, slots, counters, M, N, K)
     stride = out.stride(0) if splits == 1 or fused > 1 else N
+    # The hoisted path reads a step's BLOCK_K / 32 scales (at most 8 bytes at
+    # a time) as aligned words. BLOCK_K 64 (16-bit words) miscompiles on
+    # Triton 3.8, so it keeps the per-step loads. The in-kernel quant computes
+    # its activation scales and keeps the per-step weight scale loads.
+    word = min(cfg.block_k // 32, 8)
+    hoist = (
+        cfg.hoist
+        and not quant_in_kernel
+        and cfg.block_k >= 128
+        and K % cfg.block_k == 0
+        and x_scale.data_ptr() % word == 0
+        and weight_scale.data_ptr() % word == 0
+    )
     if cfg.packed:
         if quant_in_kernel:
             # Same output contract as the packed kernel below (partials at
@@ -925,6 +1095,7 @@ def _launch(
                 K_PER_SPLIT=k_per_split,
                 EVEN_K=K % step == 0,
                 FUSED_SPLITS=fused,
+                HOIST_SCALES=hoist,
                 **opts,
             )
     else:
@@ -938,6 +1109,7 @@ def _launch(
             N_FIRST=cfg.n_first,
             EVEN_K=K % k_per_split == 0,
             FUSED_SPLITS=fused,
+            HOIST_SCALES=hoist,
             **opts,
         )
     if fused == 1 and splits > 1:
