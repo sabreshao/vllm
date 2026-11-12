@@ -2014,6 +2014,79 @@ def rocm_inv_rope_einsum(
 
 
 @triton.jit
+def _mxfp8_wo_a_words_to_scales(sel, BKS: tl.constexpr):
+    # [rows, BKS] int32/int64 (each column holding the word with its byte)
+    # -> [rows, BKS] E8M0 bytes, little-endian.
+    WB: tl.constexpr = 4 if BKS == 4 else 8
+    sh = ((tl.arange(0, BKS) % WB) * 8).to(sel.dtype)
+    return ((sel >> sh[None, :]) & 0xFF).to(tl.uint8)
+
+
+@triton.jit
+def _mxfp8_wo_a_hoisted_scales(
+    ptr, rows, row_stride, col0, i, KIT: tl.constexpr, BKS: tl.constexpr
+):
+    """E8M0 scales of K step i as [rows, BKS] uint8 for per-thread rows.
+
+    The CTA's whole K range is loaded once as int32/int64 words (loop
+    invariant, hoisted by LICM; row_stride and col0 in bytes) and step i's
+    word(s) picked by a where-chain on the loop index. Per-step byte loads
+    were staged through LDS and waited on behind the next stage's tile DMA,
+    draining the prefetch every iteration.
+    """
+    WB: tl.constexpr = 4 if BKS == 4 else 8
+    NW: tl.constexpr = BKS // WB
+    if WB == 4:
+        p = ptr.to(tl.pointer_type(tl.int32))
+    else:
+        p = ptr.to(tl.pointer_type(tl.int64))
+    base = p + rows * (row_stride // WB) + col0 // WB
+    word_col = (tl.arange(0, BKS) // WB)[None, :]
+    sel = tl.where(
+        word_col == 0, _mxfp8_wo_a_chain_word(base, 0, i, KIT, NW)[:, None], 0
+    )
+    for s in tl.static_range(1, NW):
+        word = _mxfp8_wo_a_chain_word(base, s, i, KIT, NW)
+        sel = tl.where(word_col == s, word[:, None], sel)
+    return _mxfp8_wo_a_words_to_scales(sel, BKS)
+
+
+@triton.jit
+def _mxfp8_wo_a_chain_word(base, s, i, KIT: tl.constexpr, NW: tl.constexpr):
+    word = tl.load(base + s)
+    for j in tl.static_range(1, KIT):
+        word = tl.where(i == j, tl.load(base + j * NW + s), word)
+    return word
+
+
+@triton.jit
+def _mxfp8_wo_a_uniform_scales(
+    ptr, row0, rows, row_stride, i, NROWS: tl.constexpr, BKS: tl.constexpr
+):
+    """Weight scales of K step i as [len(rows), BKS] uint8 when the tile
+    spans only NROWS scale rows (row0 .. row0 + NROWS - 1): CTA-uniform word
+    loads per step (no per-lane chain), broadcast onto the tile's rows."""
+    WB: tl.constexpr = 4 if BKS == 4 else 8
+    NW: tl.constexpr = BKS // WB
+    if WB == 4:
+        p = ptr.to(tl.pointer_type(tl.int32))
+    else:
+        p = ptr.to(tl.pointer_type(tl.int64))
+    base = p + i * NW
+    row = (rows - row0)[:, None]
+    word_col = (tl.arange(0, BKS) // WB)[None, :]
+    sel = tl.where(
+        (row == 0) & (word_col == 0), tl.load(base + row0 * (row_stride // WB)), 0
+    )
+    for r in tl.static_range(NROWS):
+        for s in tl.static_range(NW):
+            if r + s > 0:
+                word = tl.load(base + (row0 + r) * (row_stride // WB) + s)
+                sel = tl.where((row == r) & (word_col == s), word, sel)
+    return _mxfp8_wo_a_words_to_scales(sel, BKS)
+
+
+@triton.jit
 def _mxfp8_wo_a_bmm_kernel(
     a_ptr,  # [T, G * K] e4m3
     as_ptr,  # [T, G * K // 32] E8M0
@@ -2035,6 +2108,7 @@ def _mxfp8_wo_a_bmm_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     QUANT_OUT: tl.constexpr,
+    HOIST_SCALES: tl.constexpr,
 ):
     # Output columns are group-major, so a BLOCK_N tile never straddles two
     # groups (R % BLOCK_N == 0) and picks its group's K slice of A.
@@ -2055,11 +2129,38 @@ def _mxfp8_wo_a_bmm_kernel(
     ws_ptrs = ws_ptr + (offs_n // SCALE_ROWS)[:, None] * stride_wsn + offs_sk[None, :]
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for _ in range(K // BLOCK_K):
+    KIT: tl.constexpr = K // BLOCK_K
+    # Weight scale rows covered by this tile (SCALE_ROWS-row blocks).
+    ws_row0 = (pid_n * BLOCK_N) // SCALE_ROWS
+    WS_ROWS: tl.constexpr = (BLOCK_N + SCALE_ROWS - 1) // SCALE_ROWS
+    for i in range(KIT):
         a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
-        a_s = tl.load(as_ptrs, mask=m_mask[:, None], other=127)
-        w = tl.load(w_ptrs)
-        w_s = tl.load(ws_ptrs)
+        if HOIST_SCALES:
+            w = tl.load(w_ptrs)
+            # Rows past num_tokens read row num_tokens - 1 (their results
+            # are never stored), so the word loads need no mask.
+            a_s = _mxfp8_wo_a_hoisted_scales(
+                as_ptr,
+                tl.minimum(offs_m, num_tokens - 1),
+                stride_ast,
+                group * (K // 32),
+                i,
+                KIT,
+                BLOCK_K // 32,
+            )
+            w_s = _mxfp8_wo_a_uniform_scales(
+                ws_ptr,
+                ws_row0,
+                offs_n // SCALE_ROWS,
+                stride_wsn,
+                i,
+                WS_ROWS,
+                BLOCK_K // 32,
+            )
+        else:
+            a_s = tl.load(as_ptrs, mask=m_mask[:, None], other=127)
+            w = tl.load(w_ptrs)
+            w_s = tl.load(ws_ptrs)
         acc += tl.dot_scaled(a, a_s, "e4m3", w.T, w_s, "e4m3")
         a_ptrs += BLOCK_K
         as_ptrs += BLOCK_K // 32
@@ -2091,34 +2192,46 @@ def _mxfp8_wo_a_bmm_kernel(
 
 
 def _mxfp8_wo_a_bmm_config(num_tokens: int, n_groups: int) -> tuple[int, ...]:
-    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages) for gfx950.
+    """(BLOCK_M, BLOCK_N, BLOCK_K, num_warps, num_stages, HOIST_SCALES) for
+    gfx950.
 
     Tuned under HIP graphs with a cold weight at G = 4 and 2, over every
     decode shape of conc 1-128 x 0-5 spec tokens plus prefill chunks up to
     8K tokens. The best tile tracks the total work T * G, so the tiers are
-    keyed on it.
+    keyed on it. G >= 8 (TP1) has its own tiers for 64 < T <= 512, tuned at
+    G = 8 for T = 96-512.
+
+    HOIST_SCALES (per-CTA scale words, see _mxfp8_wo_a_hoisted_scales) wins
+    3-11% in the 3-stage tiers and loses 2-9% in the 2-stage 64x64 /
+    128x128 tiers, so it is set per tier.
 
     This will be replaced after new GEMM kernel from AITER with proper 32x32 scale
     shape GEMM fp8 enabled.
     """
+    if n_groups >= 8 and 64 < num_tokens <= 512:
+        if num_tokens <= 128:
+            return 64, 64, 256, 4, 3, True
+        if num_tokens <= 256:
+            return 128, 64, 256, 8, 3, True
+        return 128, 128, 256, 4, 2, False
     work = num_tokens * n_groups
     if work <= 64:
-        return 16, 16, 1024, 2, 3
+        return 16, 16, 1024, 2, 3, True
     if work <= 128:
-        return 32, 16, 1024, 2, 3
+        return 32, 16, 1024, 2, 3, True
     if work <= 256:
-        return 32, 32, 512, 2, 3
+        return 32, 32, 512, 2, 3, True
     if work <= 512:
-        return 64, 32, 512, 2, 3
+        return 64, 32, 512, 2, 3, True
     if work <= 1024:
-        return 64, 64, 512, 4, 2
+        return 64, 64, 512, 4, 2, False
     if work <= 2048:
-        return 64, 64, 256, 4, 2
+        return 64, 64, 256, 4, 2, False
     if work <= 3072:
-        return 64, 64, 256, 2, 1
+        return 64, 64, 256, 2, 1, False
     if work <= 4096:
-        return 128, 128, 256, 8, 2
-    return 128, 128, 128, 4, 2
+        return 128, 128, 256, 8, 2, False
+    return 128, 128, 128, 4, 2, False
 
 
 def _rocm_mxfp8_wo_a_bmm_impl(
@@ -2151,10 +2264,23 @@ def _launch_mxfp8_wo_a_bmm(
         return
     group_dim = a.shape[1] // n_groups
     o_lora_rank = out.shape[1] // n_groups
-    block_m, block_n, block_k, num_warps, num_stages = _mxfp8_wo_a_bmm_config(
+    block_m, block_n, block_k, num_warps, num_stages, hoist = _mxfp8_wo_a_bmm_config(
         num_tokens, n_groups
     )
     assert out_scale is None or block_n % 32 == 0
+    # Hoisted scales are read as BLOCK_K // 32-byte aligned words (4 or 8 B).
+    word = 4 if block_k == 128 else 8
+    scale_rows = weight.shape[0] // weight_scale.shape[0]
+    hoist_scales = (
+        hoist
+        and block_k >= 128
+        and triton.cdiv(block_n, scale_rows) <= 4
+        and (group_dim // 32) % word == 0
+        and a_scale.stride(0) % word == 0
+        and weight_scale.stride(0) % word == 0
+        and a_scale.data_ptr() % word == 0
+        and weight_scale.data_ptr() % word == 0
+    )
     grid = (n_groups * o_lora_rank // block_n, triton.cdiv(num_tokens, block_m))
     _mxfp8_wo_a_bmm_kernel[grid](
         a,
@@ -2172,11 +2298,12 @@ def _launch_mxfp8_wo_a_bmm(
         out_scale.stride(0) if out_scale is not None else 0,
         R=o_lora_rank,
         K=group_dim,
-        SCALE_ROWS=weight.shape[0] // weight_scale.shape[0],
+        SCALE_ROWS=scale_rows,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         QUANT_OUT=out_scale is not None,
+        HOIST_SCALES=hoist_scales,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -2192,7 +2319,7 @@ def _rocm_mxfp8_wo_a_bmm_quant_impl(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_tokens = a.shape[0]
     width = n_groups * o_lora_rank
-    _, block_n, _, _, _ = _mxfp8_wo_a_bmm_config(max(num_tokens, 1), n_groups)
+    block_n = _mxfp8_wo_a_bmm_config(max(num_tokens, 1), n_groups)[1]
     if block_n % 32 != 0:
         # Tiles narrower than a scale group: quantize the bf16 product instead.
         from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
