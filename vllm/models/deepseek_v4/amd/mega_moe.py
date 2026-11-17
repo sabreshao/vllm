@@ -7,6 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import VllmConfig
 from vllm.distributed import get_ep_group
@@ -38,6 +39,11 @@ def _fanout_pair_config(runtime: Any) -> torch.Tensor | None:
         return None
     pair_config = workspace.get("fanout_pair_config")
     return pair_config if isinstance(pair_config, torch.Tensor) else None
+
+
+# Per-rank capacities of AITER's single-kernel MegaMoE runtimes (MegaMoEV2's
+# small-input defaults); a call takes the smallest one that fits.
+_SINGLE_KERNEL_CAPACITIES = (256, 512)
 
 
 @triton.jit
@@ -140,6 +146,8 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         self._runtimes: list[tuple[int, Any]] = []
         # Inert until EPLB registers the layer (set_eplb_state).
         self.eplb_state = EplbLayerState()
+        # AITER single-kernel MegaMoE runtimes, same layout; empty when unused.
+        self._single_kernel_runtimes: list[tuple[int, Any]] = []
 
     def weight_loader(
         self,
@@ -205,6 +213,11 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         ):
             capacities.insert(0, fixed_slot_max_tokens)
         self._runtimes = [(c, self.get_runtime(c)) for c in capacities]
+        self._single_kernel_runtimes = self._get_single_kernel_runtimes()
+        for _, runtime in self._single_kernel_runtimes:
+            # The single kernel keeps W2's pointers in a per-weights dispatch
+            # table that can only be built outside CUDA graph capture.
+            runtime.w2_dispatch_table(self.w2_weight, self.w2_weight_scale)
 
     def _uses_fixed_slot(self, max_tok_per_rank: int) -> bool:
         from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
@@ -219,8 +232,8 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             world_size=self.ep_size,
         ).fixed_slot_dispatch
 
-    def get_runtime(self, max_tok_per_rank: int) -> Any:
-        key = (
+    def _runtime_key(self, max_tok_per_rank: int) -> tuple:
+        return (
             id(get_ep_group().cpu_group),
             torch.accelerator.current_device_index(),
             self.num_experts,
@@ -230,6 +243,9 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             max_tok_per_rank,
             self.swiglu_limit,
         )
+
+    def get_runtime(self, max_tok_per_rank: int) -> Any:
+        key = self._runtime_key(max_tok_per_rank)
         runtime = self._runtime_cache.get(key)
         if runtime is None:
             from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
@@ -257,7 +273,71 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             self._runtime_cache[key] = runtime
         return runtime
 
-    def select_runtime(self, num_tokens: int) -> Any:
+    def _get_single_kernel_runtimes(self) -> list[tuple[int, Any]]:
+        """AITER's single-kernel MegaMoE runtimes, ascending by capacity, or []
+        when disabled, when this AITER has no single kernel, or when it does not
+        support this layout."""
+        if not envs.VLLM_ROCM_AITER_MEGA_MOE_SINGLE_KERNEL:
+            return []
+        try:
+            from aiter.jit.utils.chip_info import get_gfx_runtime
+            from aiter.ops.flydsl.kernels.mega_moe.mega_moe_small_m import (
+                SmallMRuntime,
+            )
+            from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import small_m_eligible
+        except ImportError:
+            logger.info_once(
+                "AITER MegaMoE: this AITER has no single-kernel MegaMoE "
+                "(needs amd-aiter >= 0.1.29); using the multi-kernel path"
+            )
+            return []
+
+        device = torch.accelerator.current_device_index()
+        if not small_m_eligible(
+            enabled=True,
+            arch=get_gfx_runtime(),
+            num_cu=torch.cuda.get_device_properties(device).multi_processor_count,
+            world_size=self.ep_size,
+            model_dim=self.hidden_size,
+            inter_dim=self.intermediate_size,
+            experts=self.num_experts,
+            topk=self.top_k,
+            quant="a8w4",
+            swiglu_limit=self.swiglu_limit,
+        ):
+            return []
+
+        runtimes = []
+        for capacity in _SINGLE_KERNEL_CAPACITIES:
+            key = ("single_kernel", *self._runtime_key(capacity))
+            runtime = self._runtime_cache.get(key)
+            if runtime is None:
+                runtime = SmallMRuntime(
+                    rank=self.ep_rank,
+                    world_size=self.ep_size,
+                    model_dim=self.hidden_size,
+                    inter_dim=self.intermediate_size,
+                    experts=self.num_experts,
+                    topk=self.top_k,
+                    quant="a8w4",
+                    w1=self.w13_weight,
+                    w1_scale=self.w13_weight_scale,
+                    w2=self.w2_weight,
+                    w2_scale=self.w2_weight_scale,
+                    max_tok_per_rank=capacity,
+                    swiglu_limit=self.swiglu_limit,
+                )
+                self._runtime_cache[key] = runtime
+            runtimes.append((capacity, runtime))
+        logger.info_once(
+            "AITER MegaMoE: batches of up to %d tokens per rank use the "
+            "single-kernel path",
+            _SINGLE_KERNEL_CAPACITIES[-1],
+        )
+        return runtimes
+
+    @staticmethod
+    def _max_tokens_across_dp(num_tokens: int) -> int:
         # Dispatch is collective, so every EP rank must pick the same runtime.
         if is_forward_context_available():
             dp_metadata = get_forward_context().dp_metadata
@@ -265,6 +345,25 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 num_tokens = max(
                     num_tokens, int(dp_metadata.num_tokens_across_dp_cpu.max())
                 )
+        return num_tokens
+
+    def _single_kernel_runtime(self, num_tokens: int) -> Any | None:
+        """The single-kernel runtime for a call of `num_tokens` (DP max taken
+        here), or None when the call takes the 4-kernel path."""
+        num_tokens = self._max_tokens_across_dp(num_tokens)
+        for max_tok_per_rank, runtime in self._single_kernel_runtimes:
+            if num_tokens <= max_tok_per_rank:
+                return runtime
+        return None
+
+    def uses_single_kernel(self, num_tokens: int) -> bool:
+        """Whether a call of `num_tokens` runs on the single kernel. Its grid
+        must be wholly resident on the GPU, so nothing may overlap it on
+        another stream (a shared expert on the aux stream hangs it)."""
+        return self._single_kernel_runtime(num_tokens) is not None
+
+    def select_runtime(self, num_tokens: int) -> Any:
+        num_tokens = self._max_tokens_across_dp(num_tokens)
         for max_tok_per_rank, runtime in self._runtimes:
             if num_tokens <= max_tok_per_rank:
                 return runtime
@@ -368,13 +467,23 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         """`topk_ids_physical`: the router already mapped `topk_ids` to EPLB
         physical experts and recorded the load."""
         assert self._runtimes
-        # Map before choosing the runtime: the fixed-slot decode runtime and
-        # the prefill runtime both dispatch physical ids.
+        # Map before choosing the runtime: the single-kernel, fixed-slot decode
+        # and prefill runtimes all dispatch physical ids.
         if not topk_ids_physical:
             topk_ids = self.map_to_physical(topk_ids)
-        runtime = self.select_runtime(hidden_states.shape[0])
         if self.fuse_shared_expert:
             topk_weights, topk_ids = self.append_shared_expert(topk_weights, topk_ids)
+        hidden_states = hidden_states.contiguous()
+        runtime = self._single_kernel_runtime(hidden_states.shape[0])
+        if runtime is not None:
+            runtime.bind_weights(
+                self.w13_weight,
+                self.w13_weight_scale,
+                self.w2_weight,
+                self.w2_weight_scale,
+            )
+            return runtime.forward(hidden_states, topk_weights, topk_ids)
+        runtime = self.select_runtime(hidden_states.shape[0])
         if self.disable_fanout_pairs:
             # The prepare kernel writes the next launch's pairs into the other
             # half of this table, so clear it before every launch.
@@ -386,7 +495,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         runtime._s1_w1_scale = self.w13_weight_scale
         runtime.w2 = self.w2_weight
         runtime.w2_scale = self.w2_weight_scale
-        return runtime.forward(hidden_states.contiguous(), topk_weights, topk_ids)
+        return runtime.forward(hidden_states, topk_weights, topk_ids)
 
 
 DeepseekV4AiterMegaMoEExperts.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]

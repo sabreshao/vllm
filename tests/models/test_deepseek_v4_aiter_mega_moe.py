@@ -333,14 +333,19 @@ def test_mega_moe_routing_matches_reference(
 
     captured = {}
 
-    def experts(x, topk_weights, topk_ids):
-        captured["weights"], captured["ids"] = topk_weights, topk_ids
-        return 2 * x
+    class Experts:
+        def __call__(self, x, topk_weights, topk_ids):
+            captured["weights"], captured["ids"] = topk_weights, topk_ids
+            return 2 * x
+
+        def uses_single_kernel(self, num_tokens):
+            # Keep the shared expert on the aux stream when shared_stream is set.
+            return False
 
     moe = DeepseekV4MoE.__new__(DeepseekV4MoE)
     torch.nn.Module.__init__(moe)
     moe.gate = Gate()
-    moe.experts = experts
+    moe.experts = Experts()
     moe.shared_experts = lambda x: 3 * x
     moe.shared_experts_stream = aux_stream() if shared_stream else None
     moe.shared_experts_events = (
