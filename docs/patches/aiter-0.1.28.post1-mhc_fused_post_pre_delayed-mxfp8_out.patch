@@ -1,0 +1,89 @@
+From 28bdbc4f57492acf2886e96cf6fb0061d0c2c86e Mon Sep 17 00:00:00 2001
+From: agent1027 <agent1027@local>
+Date: Tue, 27 Oct 2026 02:57:59 -0500
+Subject: [PATCH 4/4] mhc fused delayed seam: optional MXFP8 copy of
+ layer_input from the reduce kernel (mxfp8_out)
+
+---
+ .../mhc_fused_post_pre_delayed_rmsnorm.py       | 17 ++++++++++++++++-
+ .../mhc_fused_post_pre_delayed_rmsnorm.py       |  8 ++++++++
+ 2 files changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/aiter/ops/triton/_triton_kernels/fusions/mhc_fused_post_pre_delayed_rmsnorm.py b/aiter/ops/triton/_triton_kernels/fusions/mhc_fused_post_pre_delayed_rmsnorm.py
+index 73ca419..a287295 100644
+--- a/aiter/ops/triton/_triton_kernels/fusions/mhc_fused_post_pre_delayed_rmsnorm.py
++++ b/aiter/ops/triton/_triton_kernels/fusions/mhc_fused_post_pre_delayed_rmsnorm.py
+@@ -236,6 +236,8 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
+     comb_out_ptr,  # (T, 4, 4) fp32
+     layer_input_ptr,  # (T, H) bf16, rescaled in place
+     norm_w_ptr,  # (H,) norm weight
++    q_ptr,  # (T, H) e4m3, QUANT_OUT only
++    q_scale_ptr,  # (T, H // 32) E8M0 bytes, QUANT_OUT only
+     rms_eps,
+     hc_pre_eps,
+     hc_sinkhorn_eps,
+@@ -245,6 +247,7 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
+     NUM_KSPLIT: tl.constexpr,
+     NUM_SINKHORN_ITERS: tl.constexpr,
+     BLOCK_C: tl.constexpr,
++    QUANT_OUT: tl.constexpr = False,
+ ):
+     """Grid (T,): one program per token."""
+     tl.static_assert(H % BLOCK_C == 0, "the norm loop has no column mask")
+@@ -308,4 +311,16 @@ def _mhc_fused_post_pre_delayed_rmsnorm_reduce_kernel(
+         xp = layer_input_ptr + t * H + rc
+         xv = tl.load(xp).to(tl.float32)
+         w = tl.load(norm_w_ptr + rc).to(tl.float32)
+-        tl.store(xp, ((xv * rstd_n) * w).to(tl.bfloat16))
++        y = ((xv * rstd_n) * w).to(tl.bfloat16)
++        tl.store(xp, y)
++        if QUANT_OUT:
++            # MXFP8 of the bf16 output (one E8M0 per 32 lanes), bit-identical to
++            # quantizing the stored row: amax at the top of the e4m3 range.
++            blocks = tl.reshape(y.to(tl.float32), (BLOCK_C // 32, 32))
++            amax = tl.maximum(tl.max(tl.abs(blocks), axis=1), 1.1754943508222875e-38)
++            bits = tl.ceil(tl.log2(amax / 448.0)) + 127.0
++            bits = tl.minimum(tl.maximum(bits, 0.0), 254.0)
++            q = tl.reshape(blocks * tl.exp2(127.0 - bits)[:, None], (BLOCK_C,))
++            tl.store(q_ptr + t * H + rc, q.to(q_ptr.dtype.element_ty))
++            rg = c0 // 32 + tl.arange(0, BLOCK_C // 32)
++            tl.store(q_scale_ptr + t * (H // 32) + rg, bits.to(tl.uint8))
+diff --git a/aiter/ops/triton/fusions/mhc_fused_post_pre_delayed_rmsnorm.py b/aiter/ops/triton/fusions/mhc_fused_post_pre_delayed_rmsnorm.py
+index d480a86..52f94d1 100644
+--- a/aiter/ops/triton/fusions/mhc_fused_post_pre_delayed_rmsnorm.py
++++ b/aiter/ops/triton/fusions/mhc_fused_post_pre_delayed_rmsnorm.py
+@@ -36,6 +36,7 @@ def mhc_fused_post_pre_delayed_rmsnorm(
+     *,
+     residual_out: torch.Tensor | None = None,
+     config: dict | None = None,
++    mxfp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+     """Fused delayed mHC seam.
+ 
+@@ -54,6 +55,10 @@ def mhc_fused_post_pre_delayed_rmsnorm(
+         residual_out: optional (T, 4, H) bf16 buffer for the new residual.
+         config: optional launch config dict; loaded from the per-arch tuned configs
+             (``get_mhc_fused_post_pre_delayed_rmsnorm_config``) when ``None``.
++        mxfp8_out: optional (T, H) e4m3 and (T, H // 32) uint8 E8M0 buffers that
++            also receive ``layer_input`` MXFP8-quantized (one scale per 32 lanes,
++            amax at the top of the e4m3 range), so a consumer can skip its own
++            quantization.
+ 
+     Returns:
+         (residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input (T, H) bf16,
+@@ -146,6 +151,8 @@ def mhc_fused_post_pre_delayed_rmsnorm(
+         comb_out,
+         layer_input,
+         norm_weight,
++        mxfp8_out[0] if mxfp8_out is not None else layer_input,
++        mxfp8_out[1] if mxfp8_out is not None else layer_input,
+         rms_eps,
+         hc_pre_eps,
+         hc_sinkhorn_eps,
+@@ -156,5 +163,6 @@ def mhc_fused_post_pre_delayed_rmsnorm(
+         NUM_SINKHORN_ITERS=int(sinkhorn_repeat),
+         BLOCK_C=config["BLOCK_C"],
+         num_warps=config["reduce_num_warps"],
++        QUANT_OUT=mxfp8_out is not None,
+     )
+     return residual_out, post_out, comb_out, layer_input, next_pre

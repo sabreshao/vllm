@@ -1,0 +1,290 @@
+diff --git a/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_combine.json b/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_combine.json
+index b1f051e4d24d71f360c7e8d1b079b00095ae717b..4134d92525127e6907124604d7da60ffd6480215 100644
+--- a/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_combine.json
++++ b/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_combine.json
+@@ -705,6 +705,150 @@
+       "warp_per_block": 16,
+       "bandwidth_gbps": 410.55,
+       "latency_us": 1012.05
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 1,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 25.84,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 2,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 64,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 24.88,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 4,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 64,
++      "rdma_block_num": 0,
++      "warp_per_block": 8,
++      "latency_us": 24.68,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 8,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 8,
++      "latency_us": 25.16,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 16,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 26.48,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 32,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 28.96,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 64,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 30.4,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 128,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 8,
++      "latency_us": 37.08,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 256,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 53.8,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 512,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 160,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 88.76,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 1024,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 256,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 159.68,
++      "zero_copy": false,
++      "quant_type": "none"
++    },
++    {
++      "dtype": "bf16",
++      "num_tokens": 2048,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 128,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 286.48,
++      "zero_copy": false,
++      "quant_type": "none"
+     }
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_dispatch.json b/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_dispatch.json
+index 18f3f0d3f17790508c600fedcf985cf218aa1afc..7e34be5c42ab4d84362ebe67c58bcc50e62d9ac2 100644
+--- a/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_dispatch.json
++++ b/mori/ops/tuning_configs/gfx950_mi355x_IntraNode_ep8_dispatch.json
+@@ -607,6 +607,126 @@
+       "warp_per_block": 16,
+       "bandwidth_gbps": 334.28,
+       "latency_us": 622.21
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 1,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 21.24
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 2,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 256,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 21.44
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 4,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 160,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 21.6
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 8,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 32,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 21.2
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 16,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 96,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 20.96
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 32,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 80,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 21.44
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 64,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 160,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 22.88
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 128,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 192,
++      "rdma_block_num": 0,
++      "warp_per_block": 4,
++      "latency_us": 28.8
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 256,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 256,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 40.44
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 512,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 256,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 62.64
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 1024,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 192,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 94.52
++    },
++    {
++      "dtype": "fp8_e4m3",
++      "num_tokens": 2048,
++      "hidden_dim": 5120,
++      "topk": 6,
++      "block_num": 256,
++      "rdma_block_num": 0,
++      "warp_per_block": 16,
++      "latency_us": 163.52
+     }
+   ]
+-}
++}
+\ No newline at end of file

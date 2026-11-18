@@ -1,0 +1,203 @@
+From 2300cf586129a17e348c6abd63734feba6a30e13 Mon Sep 17 00:00:00 2001
+From: agent1027 <agent1027@local>
+Date: Mon, 26 Oct 2026 23:36:51 -0500
+Subject: [PATCH] sparse_mla gluon: optional NaN scrub of the extra (top-k)
+ cache (extra_scrub_nan)
+
+Rebased onto amd-aiter 0.1.29 (vLLM nightly be47189f3): the DSv4 dispatch in
+sparse_mla_fwd now also routes fp8_scalar caches to the new gfx950 fp8 kernel
+and pa_decode_sparse grew a gfx1250 fp8 path; extra_scrub_nan is only
+implemented by the gfx950 gluon DSv4 driver, so both other paths reject it.
+---
+ .../_gluon_kernels/gfx950/attention/sparse_mla.py  | 14 ++++++++++++++
+ aiter/ops/triton/attention/pa_decode_sparse.py     | 13 +++++++++++--
+ aiter/ops/triton/attention/sparse_mla.py           | 11 +++++++++++
+ 3 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/aiter/ops/triton/_gluon_kernels/gfx950/attention/sparse_mla.py b/aiter/ops/triton/_gluon_kernels/gfx950/attention/sparse_mla.py
+index 0372c17..9693781 100644
+--- a/aiter/ops/triton/_gluon_kernels/gfx950/attention/sparse_mla.py
++++ b/aiter/ops/triton/_gluon_kernels/gfx950/attention/sparse_mla.py
+@@ -588,6 +588,9 @@ class Fmt:
+     TOK_U16: gl.constexpr  # the same row in bf16-view units
+     ROPE_U16_OFF: gl.constexpr  # bf16-view offset of the rope tail in a row
+     SCL_TRAILER_U8: gl.constexpr  # dsv4: scale bytes per token in the block trailer
++    # Zero NaN K/V values after dequant (caches not written by the canonical
++    # writer, e.g. loaded by a KV connector, may hold NaN code points).
++    SCRUB_NAN: gl.constexpr
+     TOK_F32: gl.constexpr  # dsmla: f32-view stride per token row
+     SCL_F32_OFF: gl.constexpr  # dsmla: f32-view offset of the group scales
+     TOK_EL: gl.constexpr  # flat formats: cache elements per token row
+@@ -603,7 +606,9 @@ class Fmt:
+         NOPE_DIM,
+         NOPE_CHUNK,
+         CHUNK_AXIS,
++        SCRUB_NAN=False,
+     ):
++        self.SCRUB_NAN = gl.constexpr(SCRUB_NAN)
+         self.KIND = gl.constexpr(KIND)
+         self.IS_FP8 = gl.constexpr(KIND != "bf16")
+         self.BLOCK_SIZE = gl.constexpr(BLOCK_SIZE)
+@@ -725,6 +730,8 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
+         val = _scaled_upcast_asm(
+             x_u8.to(gl.int16, bitcast=True), s_even, W8, cfg.gather_l
+         )
++        if fmt.SCRUB_NAN:
++            val = gl.where(val == val, val, gl.zeros_like(val))
+         if AXIS == 1:
+             kv_smem.slice(off, W8, dim=1).store(val)
+         else:
+@@ -745,6 +752,8 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
+                 "fp8_dsv4_mla dequantizes with DEQ upcast or asm",
+             )
+             val = (_fp8_to_f32(x_u8) * sc).to(gl.bfloat16)
++        if fmt.SCRUB_NAN:
++            val = gl.where(val == val, val, gl.zeros_like(val))
+         if AXIS == 1:
+             kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
+         else:
+@@ -1206,6 +1215,8 @@ def _stage(cfg, seg, x_u8, sc, k_rope, kv_smem, rope_smem):
+     else:
+         _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
+         if fmt.KIND == "fp8_dsv4_mla":
++            if fmt.SCRUB_NAN:
++                k_rope = gl.where(k_rope == k_rope, k_rope, gl.zeros_like(k_rope))
+             kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
+         elif fmt.KIND == "fp8_dsv32_mla":
+             rope_smem.store(k_rope)
+@@ -2273,6 +2284,8 @@ def _sparse_mla(
+     os_stride0: gl.constexpr = 0,
+     INV_ROPE: gl.constexpr = False,
+     OUT_MXFP8: gl.constexpr = False,
++    # Zero NaN values gathered from the extra (top-k) cache; see Fmt.SCRUB_NAN.
++    EXTRA_SCRUB_NAN: gl.constexpr = False,
+ ):
+     """One program = (query, split, head-block). Two-loop: main (SWA) then
+     extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
+@@ -2422,6 +2435,7 @@ def _sparse_mla(
+         NOPE_DIM,
+         NOPE_CHUNK,
+         CHUNK_AXIS,
++        EXTRA_SCRUB_NAN,
+     )
+ 
+     h_off = pid_h * BLOCK_M
+diff --git a/aiter/ops/triton/attention/pa_decode_sparse.py b/aiter/ops/triton/attention/pa_decode_sparse.py
+index 1208c79..8e59c17 100644
+--- a/aiter/ops/triton/attention/pa_decode_sparse.py
++++ b/aiter/ops/triton/attention/pa_decode_sparse.py
+@@ -113,6 +113,7 @@ def pa_decode_sparse(
+     inv_rope_positions: torch.Tensor | None = None,
+     inv_rope_cos_sin_cache: torch.Tensor | None = None,
+     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
++    extra_scrub_nan: bool = False,
+ ) -> torch.Tensor:
+     """Sparse paged-decode attention with split-K + widened BLOCK_H.
+ 
+@@ -249,6 +250,9 @@ def pa_decode_sparse(
+         inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
+             the output epilogue (see _pa_decode_sparse_gfx950_gluon). Rejected
+             everywhere else.
++        extra_scrub_nan: gfx950 gluon only — zero NaN values read from the
++            extra cache, for caches a KV connector filled. Rejected everywhere
++            else.
+ 
+     Returns:
+         ``[N, H, D]`` attention output, same dtype as ``q``. When
+@@ -307,6 +311,8 @@ def pa_decode_sparse(
+                 "output epilogue) are gfx950 gluon only; the gfx1250 fp8 path "
+                 "returns bf16 without the inverse RoPE"
+             )
++        if extra_scrub_nan:
++            raise NotImplementedError("extra_scrub_nan is gfx950 gluon only")
+         return _pa_decode_sparse_gfx1250_fp8(
+             q,
+             unified_kv,
+@@ -383,6 +389,7 @@ def pa_decode_sparse(
+                 inv_rope_positions=inv_rope_positions,
+                 inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+                 out_mxfp8=out_mxfp8,
++                extra_scrub_nan=extra_scrub_nan,
+             )
+ 
+     assert extra_cache is None and extra_indices is None and extra_indptr is None, (
+@@ -390,8 +397,8 @@ def pa_decode_sparse(
+         "the gfx1250 fp8 path"
+     )
+     assert (
+-        inv_rope_positions is None and out_mxfp8 is None
+-    ), "the output epilogue is gfx950 gluon-only"
++        inv_rope_positions is None and out_mxfp8 is None and not extra_scrub_nan
++    ), "the output epilogue and extra_scrub_nan are gfx950 gluon-only"
+     if kv_scales is not None:
+         raise RuntimeError(
+             "kv_scales (a flat fp8 pool with fp32 scales) is gfx950-only, with "
+@@ -746,6 +753,7 @@ def _pa_decode_sparse_gfx950_gluon(
+     inv_rope_positions=None,
+     inv_rope_cos_sin_cache=None,
+     out_mxfp8=None,
++    extra_scrub_nan=False,
+ ):
+     """Merged gfx950 gluon DSv4 sparse-MLA decode driver. Format from cache.ndim:
+     3D [nb, block, 584] -> packed fp8_dsv4_mla (uint8: 448 NoPE fp8 e4m3 OCP +
+@@ -1079,6 +1087,7 @@ def _pa_decode_sparse_gfx950_gluon(
+         # Gather a tile ahead only for fp8_dsv4_mla's 32-head programs below prefill
+         # size.
+         DSV4_PREFETCH=packed_fp8 and BLOCK_M == 32 and not prefill,
++        EXTRA_SCRUB_NAN=bool(extra_scrub_nan) and extra_cache is not None,
+         num_warps=num_warps,
+         waves_per_eu=waves_per_eu,
+         **prefill_kw,
+diff --git a/aiter/ops/triton/attention/sparse_mla.py b/aiter/ops/triton/attention/sparse_mla.py
+index 2545241..ca09125 100644
+--- a/aiter/ops/triton/attention/sparse_mla.py
++++ b/aiter/ops/triton/attention/sparse_mla.py
+@@ -419,6 +419,7 @@ def _forward_paged(
+     inv_rope_positions,
+     inv_rope_cos_sin_cache,
+     out_mxfp8,
++    extra_scrub_nan=False,
+ ):
+     """dsv4 and the SWA+top-k two-loop, until the two launchers merge."""
+     from aiter.ops.triton.attention.pa_decode_sparse import pa_decode_sparse
+@@ -455,6 +456,7 @@ def _forward_paged(
+         inv_rope_positions=inv_rope_positions,
+         inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
+         out_mxfp8=out_mxfp8,
++        extra_scrub_nan=extra_scrub_nan,
+     )
+     return res if isinstance(res, tuple) else (res, None)
+ 
+@@ -718,6 +720,7 @@ def sparse_mla_fwd(
+     inv_rope_positions: torch.Tensor | None = None,
+     inv_rope_cos_sin_cache: torch.Tensor | None = None,
+     out_mxfp8: tuple[torch.Tensor, torch.Tensor] | None = None,
++    extra_scrub_nan: bool = False,
+ ) -> tuple[torch.Tensor, torch.Tensor | None]:
+     """Sparse (top-k gathered) MLA attention.
+ 
+@@ -813,6 +816,9 @@ def sparse_mla_fwd(
+             MXFP8-quantized, one scale per 32 lanes, and data viewed as
+             [C, H, D] is returned. It matches vLLM's inverse-RoPE + MXFP8
+             pass on the bf16 rows up to rounding.
++        extra_scrub_nan: zero NaN values read from the extra (top-k) cache,
++            for caches a KV connector filled rather than the canonical writer.
++            DeepSeek-V4 two-loop caches only.
+ 
+     Returns:
+         (out, lse), out is
+@@ -899,6 +905,11 @@ def sparse_mla_fwd(
+             inv_rope_positions,
+             inv_rope_cos_sin_cache,
+             out_mxfp8,
++            extra_scrub_nan,
++        )
++    if extra_scrub_nan:
++        raise ValueError(
++            f"extra_scrub_nan needs a DeepSeek-V4 two-loop cache, got {fmt}"
+         )
+     arch = arch_info.get_arch()
+     assert arch in SUPPORTED_ARCHS, f"sparse_mla_fwd does not support {arch}"
+-- 
+2.34.1
+
