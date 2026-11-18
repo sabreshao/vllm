@@ -98,12 +98,24 @@ def _aiter_sparse_mla_enabled(
     # produced. The aiter kernel then zeroes NaN values it gathers from the
     # extra cache, like the Triton path (see
     # DeepseekV41ROCMAiterMLAAttention._aiter_sparse_mla), but only for the
-    # packed fp8_ds_mla record: the per-tensor fp8 rows have no scrub.
+    # packed fp8_ds_mla record (the per-tensor fp8 rows have no scrub) and
+    # only with an aiter build that has the scrub.
     if has_foreign_kv_writer and not packed_kv_cache:
         logger.warning_once(
             "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is ignored with a KV "
             "connector that may load non-canonical KV into a per-tensor fp8 "
             "cache; DeepSeek V4 keeps the Triton sparse attention."
+        )
+        return False
+    if (
+        has_foreign_kv_writer
+        and not rocm_aiter_ops.sparse_mla_supports_extra_scrub_nan()
+    ):
+        logger.warning_once(
+            "VLLM_ROCM_USE_AITER_TRITON_SPARSE_MLA is ignored with a KV "
+            "connector that may load non-canonical KV: the installed aiter "
+            "sparse_mla_fwd has no extra_scrub_nan; DeepSeek V4 keeps the "
+            "Triton sparse attention."
         )
         return False
     return True

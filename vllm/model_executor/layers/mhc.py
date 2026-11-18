@@ -416,8 +416,15 @@ class MHCPreDelayedOp(CustomOp):
             residual_out = (
                 torch.empty_like(residual) if sublayer_out is not None else None
             )
+            from vllm._aiter_ops import rocm_aiter_ops
+
             mxfp8_data = mxfp8_scale = None
-            if mxfp8_out:
+            # Without the MXFP8 epilogue in the installed aiter the consumers
+            # quantize the layer input themselves.
+            if (
+                mxfp8_out
+                and rocm_aiter_ops.mhc_fused_post_pre_delayed_supports_mxfp8_out()
+            ):
                 from vllm.model_executor.layers.fusion.mxfp8_companion import (
                     empty_mxfp8,
                 )

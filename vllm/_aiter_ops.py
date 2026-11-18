@@ -671,6 +671,23 @@ def _check_aiter_mla_fp8_support() -> bool:
     return _AITER_MLA_SUPPORTS_FP8
 
 
+@functools.cache
+def _aiter_fn_accepts(module: str, fn: str, param: str) -> bool:
+    """Whether the installed aiter's `module.fn` takes `param`.
+
+    Lets callers use an optional argument that only some aiter builds have
+    and keep working, without it, on the others.
+    """
+    try:
+        import importlib
+        import inspect
+
+        func = getattr(importlib.import_module(module), fn)
+        return param in inspect.signature(func).parameters
+    except (ImportError, AttributeError, ValueError, TypeError):
+        return False
+
+
 def _rocm_aiter_gather_kv_b_proj_impl(
     kv_cache: torch.Tensor,
     kv_scale: torch.Tensor,
@@ -2635,6 +2652,26 @@ class rocm_aiter_ops:
         return cls._AITER_ENABLED and cls._TRITON_ROTARY_EMBED
 
     @classmethod
+    def sparse_mla_supports_extra_scrub_nan(cls) -> bool:
+        """Whether aiter's sparse_mla_fwd can zero NaNs read from the extra
+        (top-k) cache, which a KV connector may have filled."""
+        return _aiter_fn_accepts(
+            "aiter.ops.triton.attention.sparse_mla",
+            "sparse_mla_fwd",
+            "extra_scrub_nan",
+        )
+
+    @classmethod
+    def mhc_fused_post_pre_delayed_supports_mxfp8_out(cls) -> bool:
+        """Whether aiter's fused delayed mHC seam can also write its layer
+        input MXFP8-quantized."""
+        return _aiter_fn_accepts(
+            "aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm",
+            "mhc_fused_post_pre_delayed_rmsnorm",
+            "mxfp8_out",
+        )
+
+    @classmethod
     @if_aiter_supported
     def is_triton_sparse_mla_enabled(cls) -> bool:
         if not cls._TRITON_SPARSE_MLA:
@@ -3864,7 +3901,8 @@ class rocm_aiter_ops:
             inv_rope_positions=inv_rope_positions,
             inv_rope_cos_sin_cache=inv_rope_cos_sin_cache,
             out_mxfp8=out_mxfp8,
-            extra_scrub_nan=extra_scrub_nan,
+            # Only builds with the scrub accept the argument.
+            **({"extra_scrub_nan": True} if extra_scrub_nan else {}),
         )
 
     @staticmethod
@@ -5082,8 +5120,11 @@ class rocm_aiter_ops:
                 norm_weight,
                 norm_eps,
                 residual_out=residual_out,
-                mxfp8_out=(
-                    (mxfp8_data, mxfp8_scale) if mxfp8_data is not None else None
+                # Only builds with the MXFP8 epilogue accept the argument.
+                **(
+                    {"mxfp8_out": (mxfp8_data, mxfp8_scale)}
+                    if mxfp8_data is not None
+                    else {}
                 ),
             )
         )
