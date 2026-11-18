@@ -307,6 +307,9 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         ):
             return []
 
+        # The fused shared expert is the last local slot of every rank; the
+        # single kernel keeps it out of its hot-expert decisions.
+        shared = {"shared_experts": 1} if self.fuse_shared_expert else {}
         runtimes = []
         for capacity in _SINGLE_KERNEL_CAPACITIES:
             key = ("single_kernel", *self._runtime_key(capacity))
@@ -326,6 +329,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                     w2_scale=self.w2_weight_scale,
                     max_tok_per_rank=capacity,
                     swiglu_limit=self.swiglu_limit,
+                    **shared,
                 )
                 self._runtime_cache[key] = runtime
             runtimes.append((capacity, runtime))
