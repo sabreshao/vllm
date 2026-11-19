@@ -835,6 +835,7 @@ class DeepseekV4MoE(nn.Module):
             events is None
             or hidden_states.shape[0] > envs.VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD
             or self.experts.uses_single_kernel(hidden_states.shape[0])
+            or self.experts.uses_large_m(hidden_states.shape[0])
         ):
             return self._forward_mega_moe_routed(
                 hidden_states, input_ids

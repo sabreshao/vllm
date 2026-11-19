@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AITER MegaMoE experts (fused dispatch, MXFP4 GEMMs, combine) for DeepSeek V4."""
 
+import inspect
 from typing import Any
 
 import torch
@@ -44,6 +45,8 @@ def _fanout_pair_config(runtime: Any) -> torch.Tensor | None:
 # Per-rank capacities of AITER's single-kernel MegaMoE runtimes (MegaMoEV2's
 # small-input defaults); a call takes the smallest one that fits.
 _SINGLE_KERNEL_CAPACITIES = (256, 512)
+# Spare large_m protocol slots beyond one per backbone and MTP MoE layer.
+_LARGE_M_SLOT_MARGIN = 8
 
 
 @triton.jit
@@ -82,6 +85,8 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
     # MegaMoEV2 owns large symmetric-heap buffers, so every layer shares one
     # instance and passes its own weights per call.
     _runtime_cache: dict[tuple, Any] = {}
+    # Next free large_m protocol slot per runtime (one slot per layer).
+    _next_large_m_slot: dict[tuple, int] = {}
 
     def __init__(
         self,
@@ -117,6 +122,12 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         self.max_num_tokens = next_power_of_2(
             vllm_config.scheduler_config.max_num_batched_tokens
         )
+        hf_config = vllm_config.model_config.hf_text_config
+        self.large_m_state_slots = (
+            int(getattr(hf_config, "num_hidden_layers", 0))
+            + int(getattr(hf_config, "num_nextn_predict_layers", 0) or 0)
+            + _LARGE_M_SLOT_MARGIN
+        )
         self.prefix = prefix
         # With EPLB, turn off AITER's runtime fanout pairs: compact dispatch
         # sends a token routed to the two busiest experts of a destination rank
@@ -144,10 +155,14 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         self.w2_weight_scale = make_param(hidden_size, intermediate_size // 32)
         # (max_tok_per_rank, runtime), ascending by capacity.
         self._runtimes: list[tuple[int, Any]] = []
-        # Inert until EPLB registers the layer (set_eplb_state).
-        self.eplb_state = EplbLayerState()
         # AITER single-kernel MegaMoE runtimes, same layout; empty when unused.
         self._single_kernel_runtimes: list[tuple[int, Any]] = []
+        # Full-capacity runtime when it carries the large_m path, and this
+        # layer's protocol slot in it.
+        self._large_m_runtime: Any = None
+        self._large_m_slot = 0
+        # Inert until EPLB registers the layer (set_eplb_state).
+        self.eplb_state = EplbLayerState()
 
     def weight_loader(
         self,
@@ -218,6 +233,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             # The single kernel keeps W2's pointers in a per-weights dispatch
             # table that can only be built outside CUDA graph capture.
             runtime.w2_dispatch_table(self.w2_weight, self.w2_weight_scale)
+        self._init_large_m(self._runtimes[-1][1])
 
     def _uses_fixed_slot(self, max_tok_per_rank: int) -> bool:
         from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
@@ -250,6 +266,19 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         if runtime is None:
             from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 
+            large_m_args: dict[str, Any] = {}
+            if (
+                envs.VLLM_ROCM_AITER_MEGA_MOE_LARGE_M
+                and max_tok_per_rank == self.max_num_tokens
+                and "large_m_state_slots" in inspect.signature(MegaMoEV2).parameters
+            ):
+                # Only the full-capacity runtime builds the large_m path, with
+                # one protocol slot per layer; AITER drops it for unsupported
+                # layouts.
+                large_m_args = {
+                    "large_m_enabled": True,
+                    "large_m_state_slots": self.large_m_state_slots,
+                }
             runtime = MegaMoEV2(
                 rank=self.ep_rank,
                 world_size=self.ep_size,
@@ -264,6 +293,7 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 w2_scale=self.w2_weight_scale,
                 max_tok_per_rank=max_tok_per_rank,
                 swiglu_limit=self.swiglu_limit,
+                **large_m_args,
             )
             if self.disable_fanout_pairs and _fanout_pair_config(runtime) is None:
                 logger.warning_once(
@@ -272,6 +302,41 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
                 )
             self._runtime_cache[key] = runtime
         return runtime
+
+    def _init_large_m(self, runtime: Any) -> None:
+        """Give this layer a protocol slot in the full-capacity runtime when
+        that runtime built AITER's large_m path; otherwise large batches keep
+        the 4-kernel MegaMoEV2 path."""
+        if not envs.VLLM_ROCM_AITER_MEGA_MOE_LARGE_M:
+            return
+        if not getattr(runtime, "large_m_available", False):
+            logger.info_once(
+                "AITER MegaMoE: this AITER has no large_m path for "
+                "max_tok_per_rank=%d experts=%d topk=%d hidden=%d inter=%d; "
+                "larger batches use the multi-kernel path",
+                self.max_num_tokens,
+                self.num_experts,
+                self.top_k,
+                self.hidden_size,
+                self.intermediate_size,
+            )
+            return
+        key = self._runtime_key(self.max_num_tokens)
+        slot = self._next_large_m_slot.get(key, 0)
+        if slot >= runtime.large_m_state_slots:
+            raise RuntimeError(
+                f"AITER MegaMoE large_m: layer {self.prefix} needs protocol slot "
+                f"{slot}, but the runtime has {runtime.large_m_state_slots}"
+            )
+        self._next_large_m_slot[key] = slot + 1
+        self._large_m_runtime = runtime
+        self._large_m_slot = slot
+        logger.info_once(
+            "AITER MegaMoE: eager batches of %d to %d tokens per rank use the "
+            "large_m path",
+            envs.VLLM_ROCM_AITER_MEGA_MOE_LARGE_M_MIN_TOKENS,
+            self.max_num_tokens,
+        )
 
     def _get_single_kernel_runtimes(self) -> list[tuple[int, Any]]:
         """AITER's single-kernel MegaMoE runtimes, ascending by capacity, or []
@@ -365,6 +430,21 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         must be wholly resident on the GPU, so nothing may overlap it on
         another stream (a shared expert on the aux stream hangs it)."""
         return self._single_kernel_runtime(num_tokens) is not None
+
+    def uses_large_m(self, num_tokens: int) -> bool:
+        """Whether a call of `num_tokens` (DP max taken here) runs on the
+        large_m path. Like the single kernel it is persistent and needs the
+        whole GPU resident, so nothing may overlap it on another stream.
+
+        Every EP rank gets the same answer: it depends only on the DP-gathered
+        token counts and on graph capture, which all ranks do together. Graph
+        captures stay on the 4-kernel path."""
+        return (
+            self._large_m_runtime is not None
+            and not torch.cuda.is_current_stream_capturing()
+            and self._max_tokens_across_dp(num_tokens)
+            >= envs.VLLM_ROCM_AITER_MEGA_MOE_LARGE_M_MIN_TOKENS
+        )
 
     def select_runtime(self, num_tokens: int) -> Any:
         num_tokens = self._max_tokens_across_dp(num_tokens)
@@ -471,8 +551,10 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
         """`topk_ids_physical`: the router already mapped `topk_ids` to EPLB
         physical experts and recorded the load."""
         assert self._runtimes
-        # Map before choosing the runtime: the single-kernel, fixed-slot decode
-        # and prefill runtimes all dispatch physical ids.
+        # Map before choosing the runtime: every runtime (single kernel,
+        # large_m, 4-kernel) dispatches physical ids. EPLB moves experts in
+        # place inside the weight tensors, and every runtime reads them by
+        # pointer at launch, so no rebinding is needed after a rearrangement.
         if not topk_ids_physical:
             topk_ids = self.map_to_physical(topk_ids)
         if self.fuse_shared_expert:
@@ -488,9 +570,23 @@ class DeepseekV4AiterMegaMoEExperts(nn.Module):
             )
             return runtime.forward(hidden_states, topk_weights, topk_ids)
         runtime = self.select_runtime(hidden_states.shape[0])
+        if runtime is self._large_m_runtime:
+            use_large_m = self.uses_large_m(hidden_states.shape[0])
+            runtime.set_large_m_enabled(use_large_m)
+            if use_large_m:
+                runtime.bind_layer(
+                    self._large_m_slot,
+                    self.w13_weight,
+                    self.w13_weight_scale,
+                    self.w2_weight,
+                    self.w2_weight_scale,
+                )
+                return runtime.forward(hidden_states, topk_weights, topk_ids)
         if self.disable_fanout_pairs:
-            # The prepare kernel writes the next launch's pairs into the other
-            # half of this table, so clear it before every launch.
+            # Only the 4-kernel path has runtime fanout pairs (the single
+            # kernel and large_m are built without fanout masks). The prepare
+            # kernel writes the next launch's pairs into the other half of
+            # this table, so clear it before every launch.
             pair_config = _fanout_pair_config(runtime)
             if pair_config is not None:
                 pair_config.zero_()

@@ -1,0 +1,1237 @@
+Subject: [PATCH] mega_moe: small_m / large_m fused paths for DeepSeek-V4.1-Flash on amd-aiter 0.1.29
+
+Base: amd-aiter v0.1.29 (a0c4b69c14), as shipped in
+vllm/vllm-openai-rocm:nightly-60bd6dd2edd175a1c55fd3488f871e4c3d2ef27d.
+Apply in an aiter source tree or in site-packages: git apply <this patch> (paths aiter/...).
+Replaces docs/patches/0001-0003 of main_1110 (their content is included): apply only this one.
+Covers only aiter/ (op_tests/ changes of the same commits are left out).
+
+Commits (git log --reverse v0.1.29..7e4e7e021):
+  137618bc0 [FlyDSL] MegaMoEV2: enable and tune small_m / large_m for Kimi-K2.6 EP8 A8W4
+  2a612fa90 [FlyDSL] MegaMoEV2: faster large_m payload dispatch
+  344fc22e8 [FlyDSL] MegaMoEV2: tune the Kimi-K2.6 main path for 16K / 32K tokens a rank
+  a60277609 [FlyDSL] MegaMoEV2: run the small-input op test on Kimi-K2.6
+  9a5c7eb0e [FlyDSL] MegaMoEV2: enable small_m / large_m for DeepSeek-V4.1-Flash EP8 A8W4
+  79bb03386 [FlyDSL] MegaMoEV2: large_m at 16384 tokens a rank for DeepSeek-V4.1-Flash
+  0aded6237 [FlyDSL] MegaMoE AOT: add DeepSeek-V4.1-Flash and the MTPR 16384 fused paths
+  168f0a237 [FlyDSL] MegaMoEV2 small_m: DeepSeek-V4.1-Flash DSpark draft MoE (E128 / top-3)
+  97d364fa7 [FlyDSL] MegaMoEV2 small_m: any experts a rank / top-k and fused shared-expert slots (main_1110 0002)
+  7e4e7e021 [FlyDSL] MegaMoEV2 small_m: GEMM2 pipelining and 256-column GEMM1 units (main_1110 0003)
+---
+diff --git a/aiter/aot/flydsl/mega_moe.py b/aiter/aot/flydsl/mega_moe.py
+index 4d5ae73b0..1c34f3042 100755
+--- a/aiter/aot/flydsl/mega_moe.py
++++ b/aiter/aot/flydsl/mega_moe.py
+@@ -19,13 +19,13 @@ the MoE replay this one runs in a process of its own, started with
+ ``GPU_ARCHS`` naming gfx950 and ``AITER_AOT_REPLAY=1``. It is skipped when
+ ``GPU_ARCHS`` names targets without gfx950.
+ 
+-The MTPR 8192 jobs build the instance with the opt-in small- and large-input
++The MTPR 8192 and 16384 jobs build the instance with the opt-in small- and large-input
+ paths turned on (``AITER_MEGA_SMALL_M`` / ``AITER_MEGA_LARGE_M``), so the
+ profiles those paths support also get their kernels; the runtime's own
+ eligibility checks decide which profiles that is.
+ 
+ Usage:
+-    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
++    # Every profile the service ships (DeepSeek-V4-Pro, Kimi-K3, Kimi-K2.6, V4.1-Flash)
+     python -m aiter.aot.flydsl.mega_moe
+ 
+     # One custom profile
+@@ -79,13 +79,30 @@ K3_INTER_DIM = 3072
+ K3_ACT = "situv2"
+ K3_SITU_BETA = 4.0
+ K3_SITU_LINEAR_BETA = 25.0
++# Kimi-K2.6 deployment profile (EP8 / epr48, topk8, d7168 / i2048, SiLU without a
++# SwiGLU clamp), a8w4 only.
++K26_EXPERTS_PER_RANKS = (48,)
++K26_TOPK = 8
++K26_MODEL_DIM = 7168
++K26_INTER_DIM = 2048
++K26_QUANTS = ("a8w4",)
++# DeepSeek-V4.1-Flash deployment profile (EP8 / epr48, topk6, d5120 / i2304, SwiGLU
++# clamp 10), a8w4 only. vLLM serves it from MTPR 16384 instances with the small- and
++# large-input paths on, so AOT keeps their kernels out of the first serving steps.
++V41F_EXPERTS_PER_RANKS = (48,)
++V41F_TOPK = 6
++V41F_MODEL_DIM = 5120
++V41F_INTER_DIM = 2304
++V41F_QUANTS = ("a8w4",)
+ WORLD_SIZE = 8
+ TOPK = 6
+ MODEL_DIM = 7168
+ INTER_DIM = 3072
+ SWIGLU_LIMIT = 10.0
+-# Instances of this MTPR also build the opt-in small- and large-input paths.
+-FUSED_PATHS_MTPR = 8192
++# Instances of these MTPRs also build the opt-in small- and large-input paths (the
++# runtime's eligibility checks decide which profiles get them: large-input at 16384
++# is DeepSeek-V4.1-Flash only).
++FUSED_PATHS_MTPRS = (8192, 16384)
+ FUSED_PATHS_ENV = {"AITER_MEGA_SMALL_M": "1", "AITER_MEGA_LARGE_M": "1"}
+ 
+ 
+@@ -147,9 +164,10 @@ def production_jobs(
+     world_size=WORLD_SIZE,
+     swiglu_limit=SWIGLU_LIMIT,
+ ):
+-    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
++    """Every geometry the service ships: V4-Pro (default shape), Kimi-K3,
++    Kimi-K2.6 and DeepSeek-V4.1-Flash.
+ 
+-    Used by the default build so both profiles are AOT-covered and neither
++    Used by the default build so every profile is AOT-covered and none
+     triggers an online JIT compile at serving time.
+     """
+     jobs = default_jobs(
+@@ -168,6 +186,26 @@ def production_jobs(
+         situ_beta=K3_SITU_BETA,
+         situ_linear_beta=K3_SITU_LINEAR_BETA,
+     )
++    jobs += default_jobs(
++        mtprs,
++        K26_EXPERTS_PER_RANKS,
++        quants=tuple(q for q in quants if q in K26_QUANTS),
++        world_size=world_size,
++        topk=K26_TOPK,
++        model_dim=K26_MODEL_DIM,
++        inter_dim=K26_INTER_DIM,
++        swiglu_limit=0.0,
++    )
++    jobs += default_jobs(
++        mtprs,
++        V41F_EXPERTS_PER_RANKS,
++        quants=tuple(q for q in quants if q in V41F_QUANTS),
++        world_size=world_size,
++        topk=V41F_TOPK,
++        model_dim=V41F_MODEL_DIM,
++        inter_dim=V41F_INTER_DIM,
++        swiglu_limit=swiglu_limit,
++    )
+     return jobs
+ 
+ 
+@@ -236,7 +274,7 @@ def compile_one_config(**job):
+     started = time.time()
+     try:
+         device = torch.device("cuda", job["rank"])
+-        fused_paths = FUSED_PATHS_ENV if job["mtpr"] == FUSED_PATHS_MTPR else {}
++        fused_paths = FUSED_PATHS_ENV if job["mtpr"] in FUSED_PATHS_MTPRS else {}
+         with (
+             mock.patch.dict(os.environ, fused_paths),
+             dry_run(ARCH, NUM_CU, name=DEVICE_NAME),
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/envs.py b/aiter/ops/flydsl/kernels/mega_moe/envs.py
+index 9a991daa7..93f3f8acc 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/envs.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/envs.py
+@@ -35,7 +35,7 @@ environment_variables: dict[str, tuple[Callable[[str], Any], str]] = {
+     "AITER_MEGA_S1_FIXED_KPAIR": (_flag, "1"),
+     # Compact dispatch producers keep two rows in flight.
+     "AITER_MEGA_DISPATCH_FAST_COPY": (_flag, "1"),
+-    # Small- and large-input paths for the EP8 DeepSeek-V4 a8w4 layout (gfx950), read when an
++    # Small- and large-input paths for the EP8 a8w4 FUSED_PATH_SHAPES layouts (gfx950), read when an
+     # instance is built. Small: single-kernel runtimes next to the main path (forward_small_m).
+     "AITER_MEGA_SMALL_M": (_flag, "0"),
+     # Large: quantization plus one persistent kernel for large per-rank inputs.
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_config.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_config.py
+index 54b590458..6e2862de8 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_config.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_config.py
+@@ -49,6 +49,35 @@ KIMI_K3_EXPERTS_PER_RANK = 112
+ R1_MODEL_DIM, R1_INTER_DIM = 7168, 2048
+ V4_MODEL_DIM, V4_INTER_DIM = 7168, 3072
+ K3_MODEL_DIM, K3_INTER_DIM = 3584, 3072
++# Kimi-K2.6: 384 experts (48 per rank at EP8), top-8, R1's 7168x2048 shape.
++KIMI_K26_EXPERTS_PER_RANK = 48
++K26_MODEL_DIM, K26_INTER_DIM = 7168, 2048
++# DeepSeek-V4.1-Flash: 384 experts (48 per rank at EP8), top-6, 5120x2304, SwiGLU clamp 10.
++V41F_MODEL_DIM, V41F_INTER_DIM = 5120, 2304
++# (model_dim, inter_dim, experts, topk, swiglu_limit) of the EP8 a8w4 SiLU layouts
++# the fused small- and large-input paths support: DeepSeek-V4-Pro, Kimi-K2.6,
++# DeepSeek-V4.1-Flash.
++FUSED_PATH_SHAPES = (
++    (V4_MODEL_DIM, V4_INTER_DIM, 384, 6, 10.0),
++    (K26_MODEL_DIM, K26_INTER_DIM, 384, 8, 0.0),
++    (V41F_MODEL_DIM, V41F_INTER_DIM, 384, 6, 10.0),
++)
++# DeepSeek-V4.1-Flash's DSpark draft MoE layers: 128 experts (16 per rank at EP8), top-3, the main model's
++# 5120x2304 expert shape and SwiGLU clamp. The small-input path only (its draft steps stay in decode sizes).
++V41F_DRAFT_SHAPE = (V41F_MODEL_DIM, V41F_INTER_DIM, 128, 3, 10.0)
++SMALL_M_SHAPES = FUSED_PATH_SHAPES + (V41F_DRAFT_SHAPE,)
++# Max tokens per rank of the large-input path: 8192 for every FUSED_PATH_SHAPES layout; V4.1-Flash also
++# runs it at 16384 (vLLM's 16384-token chunks reach past 8192 tokens a rank in most prefill steps).
++LARGE_M_MTPR_SHAPES = {
++    8192: FUSED_PATH_SHAPES,
++    16384: ((V41F_MODEL_DIM, V41F_INTER_DIM, 384, 6, 10.0),),
++}
++
++
++def large_m_shape_supported(max_tok_per_rank, model_dim, inter_dim, experts, topk, swiglu_limit) -> bool:
++    """Whether the large-input path supports this (max tokens per rank, layout)."""
++    shape = (int(model_dim), int(inter_dim), int(experts), int(topk), float(swiglu_limit))
++    return shape in LARGE_M_MTPR_SHAPES.get(int(max_tok_per_rank), ())
+ # EPLB redundant-expert profiles (r32 / r64) share V4-Pro's shape and FP4
+ # prelude but have no per-bucket tuner of their own.
+ V4_EPLB_EXPERTS_PER_RANKS = (52, 56)
+@@ -770,6 +799,27 @@ def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+     return config
+ 
+ 
++def _tune_kimi_k26(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
++    """Kimi-K2.6 (48 experts per rank, 7168x2048, top-8) A8W4: the base config, except
++    the 16K / 32K buckets of the large-MTPR class (above the large-input path's 8192
++    tokens a rank), whose Stage2 runs the deep pipeline with a wider skew cohort."""
++    if (
++        ctx.a_dtype == ACTIVATION_FP8
++        and ctx.mtpr_class == MAX_MTPR_CLASS
++        and ctx.bucket in (16384, 32768)
++    ):
++        config = _replace_config(
++            config,
++            stage2={
++                "persist_cu": 224,
++                "skew_cu": 224,
++                "b2stage": True,
++                "deep_a_pipeline": True,
++            },
++        )
++    return config
++
++
+ def _tune_v41_flash_ep2(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
+     """DeepSeek-V4.1-Flash at EP2 (192 experts per rank), the two buckets swept
+     on gfx950 (bench_mega_moe_v2, 384 and 16384 source tokens a rank): SBM32
+@@ -864,6 +914,13 @@ _NETWORKS = (
+     NetworkProfile(
+         "kimi_k3", KIMI_K3_EXPERTS_PER_RANK, K3_MODEL_DIM, K3_INTER_DIM, _tune_kimi_k3
+     ),
++    NetworkProfile(
++        "kimi_k26",
++        KIMI_K26_EXPERTS_PER_RANK,
++        K26_MODEL_DIM,
++        K26_INTER_DIM,
++        _tune_kimi_k26,
++    ),
+     NetworkProfile(
+         "v41_flash_ep2",
+         192,
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_fused_gemm.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_fused_gemm.py
+index 343eb933e..ba80cf880 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_fused_gemm.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_fused_gemm.py
+@@ -52,8 +52,9 @@ TOKEN_BUCKETS = (
+ )
+ # The small-input single kernel keeps fixed slots up to this MTPR (past it the main path is faster).
+ SMALL_M_FIXED_SLOT_MAX_MTPR = 512
+-# The large-input path runs on an instance of this MTPR only.
++# The large-input path runs on instances of these MTPRs (mega_moe_config.LARGE_M_MTPR_SHAPES gates the layouts).
+ LARGE_M_MTPR = 8192
++LARGE_M_MTPRS = (8192, 16384)
+ REFERENCE_EXPERTS_PER_RANK = 48
+ EXPERT_CONFIG_GRANULARITY = 64
+ 
+@@ -149,11 +150,16 @@ def _fixed_dispatch_cu(bucket: int) -> int:
+     return min(224, 16 * (bucket.bit_length() + 7))
+ 
+ 
+-def _select_fixed_stage1(bucket: int, experts_per_rank: int) -> Stage1Config:
++def _select_fixed_stage1(
++    bucket: int, experts_per_rank: int, inter_dim: int
++) -> Stage1Config:
+     grid_mult = max(1, bucket // 4) if bucket <= 16 else 3
++    # The small-input kernel cuts its XCD slices on groups of 4 n-tiles, so a tile_n must give
++    # a multiple of 4 n-tiles: V4.1-Flash's 2 x 2304 takes 128 (36 tiles) where 256 gives 18.
++    tile_n = 256 if bucket <= 8 and (2 * inter_dim // 256) % 4 == 0 else 128
+     return Stage1Config(
+         sort_block_m=32,
+-        tile_n=256 if bucket <= 8 else 128,
++        tile_n=tile_n,
+         num_waves=4,
+         grid_mult=grid_mult,
+         num_dispatch_cu=_scale_dispatch_cu(
+@@ -190,7 +196,9 @@ def _large_config(
+         tile_n=512 if inter_dim >= 2048 else 256,
+         num_waves=8,
+         grid_mult=1,
+-        num_dispatch_cu=_scale_dispatch_cu(96, experts_per_rank),
++        # Payload helper CTAs (mega_moe_large_m.LARGE_M_DISPATCH) share the dispatch, so fewer
++        # producers leave more CTAs to GEMM1.
++        num_dispatch_cu=_scale_dispatch_cu(48, experts_per_rank),
+         mfma_amajor=True,
+         async_a_copy=True,
+         use_tile_resource=True,
+@@ -213,9 +221,9 @@ def _large_config(
+ def _select_config(
+     bucket: int, mtpr: int, experts_per_rank: int, model_dim: int, inter_dim: int
+ ) -> MegaMoEConfig:
+-    if mtpr == LARGE_M_MTPR:
++    if mtpr in LARGE_M_MTPRS:
+         return _large_config(experts_per_rank, model_dim, inter_dim)
+-    stage1 = _select_fixed_stage1(bucket, experts_per_rank)
++    stage1 = _select_fixed_stage1(bucket, experts_per_rank, inter_dim)
+     stage2 = _select_fixed_stage2(bucket, model_dim)
+     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
+ 
+@@ -228,10 +236,10 @@ def select_mega_moe_config(
+     model_dim: int = 7168,
+     inter_dim: int = 3072,
+ ) -> MegaMoEConfig:
+-    """Small-input (fixed-slot, MTPR <= 512) or large-input (MTPR 8192) config for ``tokens`` per rank."""
++    """Small-input (fixed-slot, MTPR <= 512) or large-input (MTPR 8192 / 16384) config for ``tokens`` per rank."""
+     if mtpr <= 0 or mtpr & (mtpr - 1):
+         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
+-    if mtpr > SMALL_M_FIXED_SLOT_MAX_MTPR and mtpr != LARGE_M_MTPR:
++    if mtpr > SMALL_M_FIXED_SLOT_MAX_MTPR and mtpr not in LARGE_M_MTPRS:
+         raise ValueError(f"no small- or large-input config for mtpr={mtpr}")
+     if tokens > mtpr:
+         raise ValueError(f"tokens={tokens} exceeds mtpr={mtpr}")
+@@ -1576,6 +1584,8 @@ def gemm2_compute_v2(
+     valid_rows=None,
+     NW=4,
+     early_b_load=False,
++    b_prefetch=False,
++    pre_loop=None,
+ ):
+     """Run the GEMM2 K-loop and return accumulators for the selected epilogue."""
+     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
+@@ -1882,7 +1892,64 @@ def gemm2_compute_v2(
+                 n += 1
+         return n
+ 
+-    if const_expr(BM == 64 and BN // NW == 64):
++    if const_expr(b_prefetch):
++        # Fully unrolled K-loop; the caller's runtime inter_dim must equal INTER_MAX. B of K-tile kt + 1 is loaded
++        # per 16-column group J right after the MFMAs of K-tile kt that free J's registers: no extra VGPRs, and
++        # ~3/4 of a K-tile for the load to land (the 1-stage path below waits a full memory latency per K-tile).
++        # LLVM makes every LDS read wait for the newest LDS DMA and VMEM returns in issue order, so the B loads
++        # follow the K-tile's A DMA (they are not forced in by the next K-tile's A ds_reads), and the scales of a
++        # K-tile are loaded before its B (a later scale would make the first MFMA wait for all of the B).
++        # pre_loop (the caller's wait for this m-tile's GEMM1 output, then its A prologue) runs after the first B
++        # loads, which only read weights, so their latency overlaps that wait. Per-accumulator MFMA order is the
++        # 1-stage path's -> bit-identical output.
++        assert BM == 64 and BN // NW == 64 and not has_pad and tilesPerScaleChunk == 1
++        KT = INTER_MAX // BK
++
++        def load_b_j(J, kt):
++            out = []
++            for half in range_constexpr(kHalves):
++                off = (bq_base_dw[J] + lane_div_16 * fx.Int32(64) + lane_mod_16 * fx.Int32(4)
++                       + fx.Int32(kt * kHalves * 256 + half * 256))
++                f = fx.make_fragment_like(frag_tmpl)
++                f.store(Vec(load_at(bq_rsrc, off, fx.Int32, 4, 2 if use_nt else 0)))
++                out.append(f)
++            return out
++
++        def load_bs(mw, kt):
++            f = fx.make_fragment_like(sc_frag_tmpl)
++            fx.copy(sc_copy_atom, bscale_views[mw][lane_div_16, lane_mod_16, fx.Int32(kt), None], f)
++            return f
++
++        if const_expr(pre_loop is None):
++            cur_sa = load_a_scale_tile(fx.Int32(0))
++        cur_bs = [load_bs(mw, 0) for mw in range_constexpr(nPairs)]
++        cur_bq = [load_b_j(J, 0) for J in range_constexpr(numAccN)]
++        if const_expr(pre_loop is not None):
++            pre_loop()
++            cur_sa = load_a_scale_tile(fx.Int32(0))
++        for kt in range_constexpr(KT):
++            gpu.barrier()
++            issue_a_ds_read(kt % aStages)
++            if const_expr(kt + kStages < KT):
++                issue_a_load_lds((kt + kStages) % aStages, kt + kStages)
++            sb_words = [Vec(cur_bs[mw].load())[0] for mw in range_constexpr(nPairs)]
++            sa_words = cur_sa
++            nxt_bq = [None] * numAccN
++            if const_expr(kt + 1 < KT):
++                rocdl.sched_barrier(0)
++                cur_sa = load_a_scale_tile(fx.Int32(kt + 1))
++                cur_bs = [load_bs(mw, kt + 1) for mw in range_constexpr(nPairs)]
++            for J in range_constexpr(numAccN):
++                rocdl.sched_barrier(0)
++                for sub in range_constexpr(kScaleSubBlocks):
++                    mma_one_j(J, J % 2, sa_words[sub], sb_words[J // 2], cur_bq, a_frags, c_frags, mma_atoms,
++                        i0=2 * sub, k_halves=kHalves)
++                rocdl.sched_barrier(0)
++                if const_expr(kt + 1 < KT):
++                    nxt_bq[J] = load_b_j(J, kt + 1)
++            if const_expr(kt + 1 < KT):
++                cur_bq = nxt_bq
++    elif const_expr(BM == 64 and BN // NW == 64):
+         # BM64 with a 64-column per-wave slab (NW4 BN256 / NW8 BN512) uses the 1-stage B path.
+         for kt_iv, state in range(
+             fx.Int32(0),
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_large_m.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_large_m.py
+index f8547223d..700e1dbb6 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_large_m.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_large_m.py
+@@ -38,6 +38,16 @@ from ..mxfp4_gemm_common import _fabs_f32 as fabs_f32
+ from ..mxfp4_gemm_common import lds_typed_ptr, lds_vec_load
+ from ..tensor_shim import _preload_compiled, _run_compiled
+ from .dispatch import _wave_inclusive_scan_i32, _wave_reduce_max_i32
++from .mega_moe_config import (
++    LARGE_M_MTPR_SHAPES,
++    K26_INTER_DIM,
++    K26_MODEL_DIM,
++    V41F_INTER_DIM,
++    V41F_MODEL_DIM,
++    V4_INTER_DIM,
++    V4_MODEL_DIM,
++    large_m_shape_supported,
++)
+ from .mega_moe_fused_gemm import (
+     AddrBuffer,
+     MegaMoEConfig,
+@@ -114,6 +124,7 @@ class DispatchSlot(IntEnum):
+     READY_TILE_TAIL = 46
+     P2P_READY_TILE_TAIL = 47
+     TILE_EXPECTED_SHARED = 48
++    PAYLOAD_CLAIM = 49
+ 
+ 
+ DISPATCH_TABLE_SIZE = max(DispatchSlot) + 1
+@@ -613,12 +624,17 @@ def emit_dispatch_payload(
+     *, num_waves, fz_epr, fz_k, fz_mtpr, fz_rank, fz_total_experts, fz_nbytes, fz_n_i32, fz_safe_end_i32,
+     fz_scale_n_i32, fz_enable_scales, addr_disp, addr_in_tok, addr_in_wts, addr_in_sc, dispatch_blocks,
+     producer_slot, parity, expected, producers_per_destination, chunks_per_destination, payload_chunk_rows,
++    claim_dynamic=False, addr_claim=0, lds_claim=0, batch_copy=0, one_fence=False,
+ ):
+ # fmt: on
+     """Produce independently publishable expert payloads from a compact plan.
+ 
+     Each (expert, chunk of payload_chunk_rows source rows) is one task; a chunk publishes the destination tiles
+     it completes, and the last chunk of an expert publishes the expert.
++
++    ``claim_dynamic``: tasks are claimed from a per-destination counter instead of a static stride.
++    ``batch_copy``: rows a wave reads before it writes any of them (0: one row at a time).
++    ``one_fence``: the release of the tile publication also covers the chunk and expert counters.
+     """
+     rdisp = AddrBuffer(addr_disp)
+ 
+@@ -656,14 +672,18 @@ def emit_dispatch_payload(
+     row_stride = fx.Int32(num_waves)
+ 
+     def _publish_task(destination, local_expert, ge):
+-        comm_ops.fence_system_release()
++        if const_expr(not one_fence):
++            comm_ops.fence_system_release()
+         ready_remote = load_at(AddrBuffer(p_payload_ready), destination, fx.Int64, 1)
+         ready_index = parity * fx.Int32(fz_epr) + local_expert
+         comm_ops.atomic_add_system(ready_remote + fx.Int64(ready_index) * fx.Int64(4), fx.Int32(1))
+         store_at(fx.Int32(0), r_lh, ge)
+ 
+     def _finish_task(destination, local_expert, ge, num_chunks):
+-        comm_ops.fence_system_release()
++        # one_fence: _publish_tile_range released this task's last payload store system-wide, and every
++        # earlier chunk of the expert did the same before it counted into PAYLOAD_CHUNK_DONE.
++        if const_expr(not one_fence):
++            comm_ops.fence_system_release()
+         completed = fx.Int32(
+             comm_ops.atomic_add_agent(a_chunk_done + fx.Int64(ge) * fx.Int64(4), fx.Int32(1))
+         )
+@@ -689,7 +709,8 @@ def emit_dispatch_payload(
+         remote_ready_rows = load_at(AddrBuffer(p_payload_ready_rows), producer_destination, fx.Int64, 1)
+         destination_ready_rows = load_at(AddrBuffer(remote_ready_rows), fx.Int32(0), fx.Int32, 1)
+     fx.barrier()
+-    for task_index in range(task0, task_limit, task_stride):
++
++    def _run_task(task_index):
+         chunk_id = task_index // fx.Int32(fz_epr)
+         rotated_expert = task_index - chunk_id * fx.Int32(fz_epr)
+         rotation = (chunk_id * fx.Int32(17)) % fx.Int32(fz_epr)
+@@ -721,7 +742,64 @@ def emit_dispatch_payload(
+         token_remote = load_at(AddrBuffer(p_rx), destination, fx.Int64, 1)
+         if const_expr(fz_enable_scales):
+             scale_remote_rsrc = AddrBuffer(load_at(AddrBuffer(p_sc), destination, fx.Int64, 1))
+-        for row in range(row_begin + row0, row_end, row_stride):
++        if const_expr(batch_copy):
++            # gfx9's vmcnt counts loads and stores alike, so every wait for a load also drains the wave's
++            # outstanding remote stores: issue all loads of batch_copy rows, wait once, then all their stores.
++            assert fz_n_i32 % 256 == 0 and (not fz_enable_scales or fz_scale_n_i32 % 4 == 0)
++            batch_rows = int(batch_copy)
++            lane_offset = lane * fx.Int32(4)
++            group_rows = row_stride * fx.Int32(64)
++            if const_expr(fz_enable_scales):
++                scale_valid = lane_offset < fx.Int32(fz_scale_n_i32)
++                scale_offset = scale_valid.select(lane_offset, fx.Int32(0))
++            for group in range(row_begin + row0, row_end, group_rows):
++                my_row = group + lane * row_stride
++                safe_row = (my_row < row_end).select(my_row, group)
++                wk_vec = load_at(r_pair, source_base + safe_row, fx.Int32, 1)
++                group_count = (row_end - group + row_stride - fx.Int32(1)) // row_stride
++                group_count = (group_count < fx.Int32(64)).select(group_count, fx.Int32(64))
++                for j in range(fx.Int32(0), group_count, batch_rows):
++                    rows = []
++                    for r in range_constexpr(batch_rows):
++                        index = j + fx.Int32(r)
++                        row_valid = index < group_count
++                        wk = fx.Int32(fx.rocdl.readlane(T.i32, wk_vec, row_valid.select(index, j)))
++                        source_token = wk // fx.Int32(fz_k)
++                        weight = load_at(r_wts, wk, fx.Float32, 1)
++                        source_rsrc = AddrBuffer(addr_in_tok + fx.Int64(source_token) * fx.Int64(fz_nbytes))
++                        values = []
++                        for c in range_constexpr(fz_n_i32 // 256):
++                            values.append(load_at(source_rsrc, lane_offset + fx.Int32(c * 256), fx.Int32, 4))
++                        scale = None
++                        if const_expr(fz_enable_scales):
++                            scale = load_at(
++                                AddrBuffer(addr_in_sc), source_token * fx.Int32(fz_scale_n_i32) + scale_offset,
++                                fx.Int32, 4,
++                            )
++                        rows.append((row_valid, wk, source_token, weight, values, scale, group + index * row_stride))
++                    for r in range_constexpr(batch_rows):
++                        row_valid, wk, source_token, weight, values, scale, row = rows[r]
++                        if row_valid:
++                            destination_row = destination_base + row
++                            destination_rsrc = AddrBuffer(
++                                token_remote + fx.Int64(destination_row) * fx.Int64(fz_nbytes))
++                            for c in range_constexpr(fz_n_i32 // 256):
++                                store_at(values[c], destination_rsrc, lane_offset + fx.Int32(c * 256))
++                            if const_expr(fz_enable_scales):  # noqa: SIM102
++                                if scale_valid:
++                                    store_at(scale, scale_remote_rsrc,
++                                             destination_row * fx.Int32(fz_scale_n_i32) + scale_offset)
++                            if lane == fx.Int32(0):
++                                topk_slot = wk % fx.Int32(fz_k)
++                                source_encoding = (
++                                    (fx.Int32(fz_rank * fz_mtpr) + source_token) | (topk_slot << fx.Int32(24)))
++                                weight_bits = fx.Vector.from_elements([weight], fx.Float32).bitcast(fx.Int32)[0]
++                                store_at(weight_bits, wts_remote_rsrc, destination_row)
++                                store_at(source_encoding, srcmap_remote_rsrc, destination_row)
++        plain_end = row_end
++        if const_expr(batch_copy):
++            plain_end = row_begin
++        for row in range(row_begin + row0, plain_end, row_stride):
+             wk_lane = fx.Int32(0)
+             if lane == fx.Int32(0):
+                 wk_lane = load_at(r_pair, source_base + row, fx.Int32, 1)
+@@ -780,6 +858,24 @@ def emit_dispatch_payload(
+                 _finish_task(destination, local_expert, ge, num_chunks)
+             fx.barrier()
+ 
++    if const_expr(claim_dynamic):
++        claim_slot = lds_typed_ptr(fx.Int32(lds_claim), T.i32)
++        claim_addr = fx.Int64(addr_claim) + fx.Int64(producer_destination) * fx.Int64(64)
++        claim_active = fx.Int32(1) == fx.Int32(1)
++        while claim_active:
++            fx.barrier()
++            if tid == fx.Int32(0):
++                task = fx.Int32(comm_ops.atomic_add_agent(claim_addr, fx.Int32(1)))
++                fx.ptr_store((task < task_limit).select(task, fx.Int32(-1)), claim_slot)
++            fx.barrier()
++            task_b = fx.Int32(fx.ptr_load(claim_slot, result_type=T.i32))
++            if task_b >= fx.Int32(0):
++                _run_task(task_b)
++            claim_active = task_b >= fx.Int32(0)
++    else:
++        for task_index in range(task0, task_limit, task_stride):
++            _run_task(task_index)
++
+ 
+ _BUFFER_OFFSET_ABI_BYTES = 1 << 31
+ 
+@@ -1168,9 +1264,17 @@ def make_stage2_body_emitter(*, model_dim, topk, rank, npes, max_tok, experts, B
+ _SC0_CACHE = 1
+ 
+ 
+-# Chunks of 3 n-major GEMM2 units keep consecutive m-blocks of one n-block together for W2 reuse while short
++# Chunks of n-major GEMM2 units keep consecutive m-blocks of one n-block together for W2 reuse while short
+ # enough to narrow the per-CTA drain tail; the kernel takes them only when the received rows warrant it.
+-LARGE_M_G2_CHUNK = 3
++# Keyed by (model_dim, inter_dim): Kimi-K2.6's shorter GEMM2 K and top-8 rows favour chunks of 2.
++LARGE_M_G2_CHUNK = {
++    (V4_MODEL_DIM, V4_INTER_DIM): 3,
++    (K26_MODEL_DIM, K26_INTER_DIM): 2,
++    (V41F_MODEL_DIM, V41F_INTER_DIM): 3,
++}
++# Payload dispatch options: rows are copied in batches (batch_copy) with one release per task (one_fence), and
++# helper CTAs move payload before they join GEMM1.
++LARGE_M_DISPATCH = {"helper_blocks": 8, "batch_copy": 1, "one_fence": True}
+ 
+ 
+ def large_m_kernel_specs(
+@@ -1242,6 +1346,7 @@ def compile_mega_moe_stage1(
+     async_a_copy: bool = False, use_tile_resource: bool = True,
+     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
+     work_shards: int = 4, payload_chunk_rows: int = 384, swiglu_limit: float = 0.0, fused_g2_chunk: int = 1,
++    helper_blocks: int = 0, batch_copy: int = 0, one_fence: bool = False,
+ ):
+     # fused_stage2 / fused_combine are hashable (key, value) specs and part of the compile key.
+     arch = get_gfx_runtime()
+@@ -1263,10 +1368,17 @@ def compile_mega_moe_stage1(
+     assert dispatch_blocks % fuse_npes == 0, "num_dispatch_cu must be divisible by fuse_npes"
+     assert payload_chunk_rows > 0 and payload_chunk_rows % sort_block_m == 0
+     planner_blocks = 1
++    # Helpers are payload-only producers, one destination each, that join GEMM1 once their destination's
++    # payload tasks are all claimed; with them the producers also claim tasks from a per-destination counter.
++    helper_blocks = int(helper_blocks)
++    payload_dynamic = helper_blocks > 0
++    assert helper_blocks % fuse_npes == 0, "helper_blocks must be divisible by fuse_npes"
++    assert not payload_dynamic or dispatch_blocks > 32, "dynamic payload claiming needs num_dispatch_cu > 32"
++    batch_copy = int(batch_copy)
+     # Keep the fused grid on an exact CU multiple instead of appending control/producer CTAs as a tail.
+-    grid_x = num_cu * grid_mult - planner_blocks - dispatch_blocks
++    grid_x = num_cu * grid_mult - planner_blocks - dispatch_blocks - helper_blocks
+     assert grid_x > 0, "consumer grid must remain positive"
+-    launch_grid_x = planner_blocks + dispatch_blocks + grid_x
++    launch_grid_x = planner_blocks + dispatch_blocks + helper_blocks + grid_x
+     assert launch_grid_x <= num_cu * 33 + 1
+     M_REPEAT = sort_block_m // 16
+     NUM_ACC_N = n_per_wave // 16
+@@ -1365,6 +1477,9 @@ def compile_mega_moe_stage1(
+         f"aa{int(async_a_copy)}"
+         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
+         f"_pc{payload_chunk_rows}"
++        f"{f'_h{helper_blocks}' if helper_blocks else ''}"
++        f"{f'_bc{batch_copy}' if batch_copy else ''}"
++        f"{'_1f' if one_fence else ''}"
+         f"{swiglu_suffix}"
+         f"_s2bm{S2_BM}bn{S2_BN}nw{S2_NW}c{G2_CHUNK}_{S2_KEY}_combu{C_U}"
+     )
+@@ -1454,6 +1569,13 @@ def compile_mega_moe_stage1(
+         owner = ticket == fx.Int32(0)
+         producer = (ticket > fx.Int32(0)) & (ticket <= fx.Int32(dispatch_blocks))
+         producer_slot = ticket - fx.Int32(1)
++        if const_expr(payload_dynamic):
++            a_payload_claim = _disp_ptr(DispatchSlot.PAYLOAD_CLAIM)
++            # A free LDS word (the ticket holds pool offset 0) broadcasts each claimed task to the CTA.
++            claim_lds = fx.Int32(fx.ptrtoint(lds.pool.ptr)) + fx.Int32(64)
++        else:
++            a_payload_claim = fx.Int64(0)
++            claim_lds = fx.Int32(0)
+ 
+         if owner:
+             next_parity_lane = fx.Int32(0)
+@@ -1491,6 +1613,10 @@ def compile_mega_moe_stage1(
+                     _buffer_store(work_head_rsrc, fx.Int32(shard * 16), fx.Int32(0), fx.Int32)
+                 _buffer_store(_make_buffer_from_addr(a_work_tail, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
+                 _buffer_store(_make_buffer_from_addr(a_group_done, fx.Int32), fx.Int32(0), fx.Int32(0), fx.Int32)
++                if const_expr(payload_dynamic):
++                    claim_rsrc = _make_buffer_from_addr(a_payload_claim, fx.Int32)
++                    for destination in range_constexpr(fz_npes):
++                        _buffer_store(claim_rsrc, fx.Int32(destination * 16), fx.Int32(0), fx.Int32)
+             # Rank-local G1 completion entries and G2 claim heads restart every launch; they are
+             # cleared before the gate so no CTA of this launch can observe stale values.
+             ctr_rsrc = _make_buffer_from_addr(addr_mtile_ctr, fx.Int32)
+@@ -1571,9 +1697,42 @@ def compile_mega_moe_stage1(
+                     producer_slot=producer_slot, parity=payload_parity, expected=payload_expected,
+                     producers_per_destination=producers_per_destination, payload_chunk_rows=payload_chunk_rows,
+                     chunks_per_destination=chunks_per_destination,
++                    claim_dynamic=payload_dynamic, addr_claim=a_payload_claim, lds_claim=claim_lds,
++                    batch_copy=batch_copy, one_fence=one_fence,
+                 )
+         addr_tile_ready = _disp_ptr(DispatchSlot.TILE_READY)
+         addr_tile_expected = _disp_ptr(DispatchSlot.TILE_EXPECTED)
++        if const_expr(helper_blocks > 0):
++            helper = (ticket > fx.Int32(dispatch_blocks)) & (ticket <= fx.Int32(dispatch_blocks + helper_blocks))
++            if helper:
++                helper_destination = (ticket - fx.Int32(1 + dispatch_blocks)) % fx.Int32(fz_npes)
++                if tid == fx.Int32(0):
++                    pair_order_ready = _disp_ptr(DispatchSlot.PAIR_ORDER_READY)
++                    comm_ops.wait_i32_until_equals(
++                        pair_order_ready + fx.Int64(payload_parity) * fx.Int64(4), payload_expected)
++                    helper_plan_ready = _disp_ptr(DispatchSlot.PLAN_READY)
++                    comm_ops.wait_i32_until_equals(
++                        helper_plan_ready
++                        + fx.Int64(payload_parity * fx.Int32(fz_npes) + fx.Int32(fz_rank)) * fx.Int64(4),
++                        payload_expected)
++                    comm_ops.fence_system_acquire()
++                fx.barrier()
++                helper_chunks = _buffer_load(
++                    _make_buffer_from_addr(a_payload_chunks_per_destination, fx.Int32),
++                    helper_destination, fx.Int32,
++                )
++                emit_dispatch_payload(
++                    num_waves=NUM_WAVES, fz_epr=fz_epr, fz_k=fz_k, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
++                    fz_total_experts=fz_total_experts, fz_nbytes=fz_nbytes, fz_n_i32=fz_n_i32,
++                    fz_safe_end_i32=fz_safe_end_i32, fz_scale_n_i32=fz_scale_n_i32,
++                    fz_enable_scales=fz_enable_scales, addr_disp=addr_disp, addr_in_tok=addr_in_tok,
++                    addr_in_wts=addr_in_wts, addr_in_sc=addr_in_sc, dispatch_blocks=dispatch_blocks,
++                    producer_slot=helper_destination, parity=payload_parity, expected=payload_expected,
++                    producers_per_destination=fx.Int32(1), payload_chunk_rows=payload_chunk_rows,
++                    chunks_per_destination=helper_chunks,
++                    claim_dynamic=True, addr_claim=a_payload_claim, lds_claim=claim_lds,
++                    batch_copy=batch_copy, one_fence=one_fence,
++                )
+         wave_id = fx.thread_idx.x // 64
+ 
+         w_rsrc = _make_buffer(w, fx.Int32, 4)
+@@ -1930,7 +2089,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
+     fused_combine_args, sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
+     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
+     use_tile_resource=True, waves_per_eu_hint=2, b_nt=-1, work_shards=4, payload_chunk_rows=384,
+-    swiglu_limit=0.0, fused_g2_chunk=1, preload=False):
++    swiglu_limit=0.0, fused_g2_chunk=1, preload=False, helper_blocks=0, batch_copy=0, one_fence=False):
+     if len(fused_args) != 14:
+         raise ValueError("fused Stage2 needs (mtile_ctr, 13 Stage2 runtime addresses)")
+     mtile_ctr, s2_args = fused_args[0], tuple(fused_args[1:])
+@@ -1947,6 +2106,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
+         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
+         b_nt=b_nt, work_shards=int(work_shards), payload_chunk_rows=payload_chunk_rows,
+         swiglu_limit=swiglu_limit, fused_g2_chunk=int(fused_g2_chunk),
++        helper_blocks=int(helper_blocks), batch_copy=int(batch_copy), one_fence=bool(one_fence),
+     )
+     # preload: compile and load without dispatching (AOT bundles).
+     (_preload_compiled if preload else _run_compiled)(
+@@ -1974,20 +2134,16 @@ class LargeMRuntime:
+         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
+             raise ValueError(f"max_tok_per_rank={max_tok_per_rank} must be a power of two")
+         arch = get_gfx_runtime()
+-        shape = (
+-            world_size,
+-            model_dim,
+-            inter_dim,
+-            experts,
+-            experts // world_size,
+-            topk,
+-            max_tok_per_rank,
+-            float(swiglu_limit),
+-        )
+-        if arch != "gfx950" or shape != (8, 7168, 3072, 384, 48, 6, 8192, 10.0):
++        if (
++            arch != "gfx950"
++            or world_size != 8
++            or not large_m_shape_supported(
++                max_tok_per_rank, model_dim, inter_dim, experts, topk, swiglu_limit
++            )
++        ):
+             raise ValueError(
+-                "the large-input path requires gfx950, EP8, 7168x3072, "
+-                "384 experts/EPR48, topk6, max_tok_per_rank 8192, and swiglu_limit=10"
++                "the large-input path requires gfx950, EP8 and one of the max_tok_per_rank -> "
++                f"(model_dim, inter_dim, experts, topk, swiglu_limit) layouts {LARGE_M_MTPR_SHAPES}"
+             )
+         self.rank = int(rank)
+         self.world_size = int(world_size)
+@@ -2101,6 +2257,7 @@ class LargeMRuntime:
+             "payload_blocks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
+             "payload_chunks_per_destination": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
+             "group_done": torch.zeros(self.world_size, dtype=torch.int32, device=self.dev),
++            "payload_claim": torch.zeros(self.world_size * 16, dtype=torch.int32, device=self.dev),
+         }
+         workspace["bigcnt"] = op._sym((self.world_size * self.epr,), torch.int32)
+         workspace["count_done"] = op._sym((2 * self.world_size,), torch.int32)
+@@ -2186,6 +2343,7 @@ class LargeMRuntime:
+         table[DispatchSlot.PAYLOAD_CHUNKS_PER_DESTINATION] = workspace[
+             "payload_chunks_per_destination"
+         ].data_ptr()
++        table[DispatchSlot.PAYLOAD_CLAIM] = workspace["payload_claim"].data_ptr()
+         return torch.tensor(table, dtype=torch.int64, device=self.dev)
+ 
+     def select_layer_state(self, layer_slot: int) -> None:
+@@ -2380,7 +2538,8 @@ class LargeMRuntime:
+             "fused_args": (self._fused_mtile_ctr.data_ptr(), *s2_args),
+             "fused_combine": c_spec,
+             "fused_combine_args": c_args,
+-            "fused_g2_chunk": LARGE_M_G2_CHUNK,
++            "fused_g2_chunk": LARGE_M_G2_CHUNK[(self.model_dim, self.inter_dim)],
++            **LARGE_M_DISPATCH,
+         }
+         return s1, kw
+ 
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_small_m.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_small_m.py
+index b13d1368f..31bbdda38 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_small_m.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_small_m.py
+@@ -331,15 +331,20 @@ def emit_direct_fixed_slot_payload(
+ 
+ @flyc.jit
+ def emit_direct_fixed_slot_finalize(
+-    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, addr_disp, parity, expected, plan_nv,
++    *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, fz_topk, addr_disp, parity, expected, plan_nv,
++    fz_routed_epr, cached_w_min_rows,
+ ):
+     """Finalize local fixed slots as soon as every source publishes this destination.
+ 
+     ``plan_nv = (addr, epoch)``: the local plan is published as one i64 ``epoch << 32 | num_valid`` store, so
+     consumers get num_valid from the flag itself. Only this rank's consumers read it. The srcmap of padding rows
+     is left unwritten: GEMM2 masks rows past the tile's valid count itself.
++    ``fz_routed_epr``: local experts [fz_routed_epr, fz_epr) are fused shared experts, which hold every local token.
++    They count toward the cached-weight decision (``cached_w_min_rows`` received rows: their m-tiles reuse their
++    weights too) but not toward the hot-expert test or the FP8-row decision, so that they alone do not switch the
++    rank to FP8 rows.
+     """
+-    assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
++    assert 0 < fz_routed_epr <= fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
+     rdisp = AddrBuffer(addr_disp)
+ 
+     def dp(i):
+@@ -374,10 +379,18 @@ def emit_direct_fixed_slot_finalize(
+         inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
+         metadata_base = inclusive_tiles - num_expert_tiles
+         total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
+-        routed_rows = fx.Int32(
++        all_rows = fx.Int32(
+             fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(safe_count, lane), fz_epr - 1)
+         )
+-        hot_expert = _wave_reduce_max_i32(safe_count, lane) >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
++        routed_count = safe_count
++        routed_rows = all_rows
++        if const_expr(fz_routed_epr < fz_epr):
++            routed_count = (lane < fx.Int32(fz_routed_epr)).select(safe_count, fx.Int32(0))
++            routed_rows = fx.Int32(
++                fx.rocdl.readlane(T.i32, _wave_inclusive_scan_i32(routed_count, lane), fz_epr - 1)
++            )
++        # The rank's received rows decide cached weights; only routed experts decide FP8 rows.
++        hot_expert = _wave_reduce_max_i32(routed_count, lane) >= fx.Int32(_HOT_EXPERT_MIN_ROWS)
+ 
+         if valid_expert:
+             if no_overflow:
+@@ -403,10 +416,10 @@ def emit_direct_fixed_slot_finalize(
+         if lane == fx.Int32(0):
+             # Low 32 bits: num_valid, plus the row-count bits of _PLAN_CACHED_W_BIT / _PLAN_FP8_ROWS_BIT.
+             nv_flag = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
+-            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_CACHED_W_MIN_ROWS))).select(
++            nv_flag = nv_flag | (hot_expert | (all_rows >= fx.Int32(cached_w_min_rows))).select(
+                 fx.Int32(1 << _PLAN_CACHED_W_BIT), fx.Int32(0)
+             )
+-            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_FP8_ROWS_MIN_ROWS))).select(
++            nv_flag = nv_flag | (hot_expert | (routed_rows >= fx.Int32(_fp8_rows_min_rows(fz_topk)))).select(
+                 fx.Int32(1 << _PLAN_FP8_ROWS_BIT), fx.Int32(0)
+             )
+             comm_ops.store_i64_global_system(
+@@ -783,14 +796,20 @@ def g2_lds_layout(*, BM, BN, BK, a_dtype, npes, g2_bf16_lds=False):
+ # fmt: off
+ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhoist, g2_ascale_pf, expert_offset,
+     npes, topk, N_OUT, max_tok, recv_cap, comb_inp_nbytes, clamp_a, store_cm=2, row_mask=False,
+-    p2p_quant_type="none"):
++    p2p_quant_type="none", pipelined=False):
+ # fmt: on
+     """One stage2 tile (m_block, n_block) as a jit helper, for kernels that run GEMM2 after their own phase.
+ 
+     Uses the absolute LDS layout of ``g2_lds_layout`` (the caller's LDS pool must start at address 0); the peer
+     table at ``layout['peer']`` must be loaded by the caller. Same numerics as the stage2 kernel.
+     ``row_mask``: rows past the tile's valid count are dropped here, so the plan need not pad their srcmap.
++    ``pipelined`` (BM 64 x 64 columns per wave, static inter_dim): the tile itself waits for its m-tile's GEMM1
++    ready epoch (ready_addr / ready_epoch), after issuing everything that does not read GEMM1 output (plan rows,
++    srcmap, weights of the first K-tile) and claiming the CTA's next unit (fetch_head - fetch_shard into the LDS
++    word fetch_slot); its K-loop prefetches B one K-tile ahead (gemm2_compute_v2 b_prefetch). Otherwise the
++    caller waits for the ready epoch and the fetch arguments are unused.
+     """
++    assert not pipelined or (BM == 64 and BN // 4 == 64)
+     assert clamp_a or not row_mask
+     lay = g2_lds_layout(BM=BM, BN=BN, BK=BK, a_dtype=a_dtype, npes=npes)
+     is_f8 = a_dtype == "fp8"
+@@ -803,20 +822,41 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
+     def g2_tile(lds_base_i32: fx.Int32, tx_i32: fx.Int32, lane: fx.Int32, wave: fx.Int32, m_block: fx.Int32,
+         n_block: fx.Int32, arg_aq: fx.Int64, arg_ascale: fx.Int64, arg_bq: fx.Int64, arg_bscale: fx.Int64,
+         arg_eids: fx.Int64, arg_stids: fx.Int64, arg_sweights: fx.Int64, arg_trb: fx.Int64, arg_tile_rows: fx.Int64,
+-        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_fp8_rows: fx.Int32):
++        i32_max_m_blocks: fx.Int32, i32_inter: fx.Int32, i32_hidden: fx.Int32, i32_fp8_rows: fx.Int32,
++        ready_addr: fx.Int64, ready_epoch: fx.Int32, fetch_head: fx.Int64, fetch_shard: fx.Int32,
++        fetch_slot: fx.Int32):
+     # fmt: on
+         num_n_blocks = fx.Int32(i32_hidden) // fx.Int32(BN)
+         k_bytes = fx.Int32(i32_inter) // fx.Int32(1 if is_f8 else 2)
++        m_row0 = m_block * fx.Int32(BM)
++        sort_block_idx = m_row0 // fx.Int32(SBM)
++        trb_v = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1)
+         vrows = None
+         if const_expr(clamp_a):
+             vrows = rocdl.readfirstlane(T.i32, load_at(AddrBuffer(arg_tile_rows), m_block, fx.Int32, 1))
+-        m_row0 = m_block * fx.Int32(BM)
+-        for slot in range_constexpr(kStages):
+-            issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane, is_f8, KH_TILE_A, k_bytes,
+-                BM=BM, valid_rows=vrows)
+-        rocdl.sched_barrier(0)
+-        sort_block_idx = m_row0 // fx.Int32(SBM)
+-        srcmap_row_base = load_at(AddrBuffer(arg_trb), sort_block_idx, fx.Int32, 1) + (m_row0 - sort_block_idx * fx.Int32(SBM))
++
++        def issue_a_prologue():
++            for slot in range_constexpr(kStages):
++                issue_a_load_lds_dt(arg_aq, lds_base_i32, slot, slot, m_row0, wave, lane, is_f8, KH_TILE_A,
++                    k_bytes, BM=BM, valid_rows=vrows)
++            rocdl.sched_barrier(0)
++
++        def fetch_then_wait_ready():
++            if tx_i32 == fx.Int32(0):
++                # Claim the CTA's next unit now; the caller reads it after its next loop barrier (ping-pong word).
++                nxt = fx.Int32(comm_ops.atomic_add_agent(fetch_head, fx.Int32(1))) - fetch_shard
++                fx.ptr_store(nxt, lds_typed_ptr(fetch_slot, T.i32, align=4))
++                comm_ops.wait_i32_until_equals(ready_addr, ready_epoch)
++            fx.barrier()
++            # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written back to
++            # memory by the other XCD into lines this XCD has not cached, before it was counted: only the CU's L1
++            # can be stale.
++            comm_ops.invalidate_l1()
++            issue_a_prologue()
++
++        if const_expr(not pipelined):
++            issue_a_prologue()
++        srcmap_row_base = trb_v + (m_row0 - sort_block_idx * fx.Int32(SBM))
+         if tx_i32 < fx.Int32(BM):
+             sorted_pos = srcmap_row_base + tx_i32
+             packed = load_at(AddrBuffer(arg_stids), sorted_pos, fx.Int32, 1)
+@@ -831,7 +871,8 @@ def make_g2_tile_runner(*, BM, BN, BK, SBM, use_nt, INTER_MAX, a_dtype, g2_bhois
+             arg_bscale, arg_eids, arg_aq, i32_max_m_blocks, unit_bx, lane, wave, i32_inter, i32_hidden,
+             fx.Int32(0), fx.Int32(0), BM=BM, BN=BN, BK=BK, use_nt=use_nt, INTER_MAX=INTER_MAX, aStages=aStages,
+             a_dtype=a_dtype, has_pad=False, SBM=SBM, g2_bhoist=g2_bhoist, g2_ascale_pf=g2_ascale_pf,
+-            expert_offset=expert_offset, valid_rows=vrows)
++            expert_offset=expert_offset, valid_rows=vrows, b_prefetch=pipelined,
++            pre_loop=fetch_then_wait_ready if pipelined else None)
+         p2p_scatter_epilog(lds_base_i32, accm_vecs, n_block_idx, wave, lane, N_OUT=N_OUT, BM=BM, BN=BN, npes=npes,
+             topk=topk, log2_max_tok=log2_max_tok, mask_max_tok=max_tok - 1, recv_cap=recv_cap,
+             comb_inp_nbytes=comb_inp_nbytes, lds_packed_off=lay["packed"], lds_weight_off=lay["weight"],
+@@ -849,7 +890,8 @@ def _use_direct_fixed_slot(npes, experts_per_rank, max_tokens_per_rank, cap, til
+     if tile_m <= 0 or max_tokens_per_rank <= 0:
+         return False
+     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
+-    return npes == 8 and experts_per_rank == 48 and cap == required_cap
++    # The plan scans one wave lane per local expert.
++    return npes == 8 and 1 <= experts_per_rank <= 64 and cap == required_cap
+ 
+ 
+ # fmt: off
+@@ -861,7 +903,7 @@ def compile_mega_moe_stage1(
+     pipe_weights: bool = True, mfma_amajor: bool = False, swizzle_a: bool = True,
+     async_a_copy: bool = False, use_tile_resource: bool = True,
+     waves_per_eu_hint: int = 2, num_cu: int = 256, num_dispatch_cu: int = 32, b_nt: int = -1,
+-    swiglu_limit: float = 0.0,
++    swiglu_limit: float = 0.0, shared_slots: int = 0,
+ ):
+     arch = get_gfx_runtime()
+     if arch != "gfx950":
+@@ -911,7 +953,11 @@ def compile_mega_moe_stage1(
+     fz_tile_m = int(sort_block_m)
+     assert fz_cap % fz_tile_m == 0, f"fuse_cap({fz_cap}) % tile_m({fz_tile_m}) != 0"
+     if not _use_direct_fixed_slot(fz_npes, fz_epr, fz_mtpr, fz_cap, fz_tile_m):
+-        raise ValueError("small-input stage1 needs the 8-rank, 48-expert fixed-slot layout")
++        raise ValueError("small-input stage1 needs the 8-rank fixed-slot layout with 1..64 experts per rank")
++    # The last shared_slots local experts are fused shared experts (SmallMRuntime(shared_experts=...)).
++    assert 0 <= shared_slots < fz_epr, "the fused shared slots must leave routed experts"
++    fz_routed_epr = fz_epr - int(shared_slots)
++    cached_w_min_rows = _CACHED_W_MIN_ROWS * fz_routed_epr // _CACHED_W_REF_EXPERTS
+     fz_total_experts = fz_npes * fz_epr
+     # Producers load their route (expert, remote pointers, row, scales, weight) before the epoch gate and
+     # quantize the bf16 input row to MXFP8. A producer wave sends pre_rounds routes (one per round) so
+@@ -939,19 +985,21 @@ def compile_mega_moe_stage1(
+     g2_n_blocks = model_dim // g2_bn
+     # The P2P row stores go to the uncached shmem heap; non-temporal stores there are slower (store_cm=0).
+     # GEMM2 masks the padding rows of each tile itself, so the plan leaves their srcmap unwritten.
++    # BM 64 x BN 256 GEMM2 tiles of a static inter_dim run the pipelined tile (see make_g2_tile_runner).
++    G2_PIPELINED = sort_block_m == 64 and g2_bn // NUM_WAVES == 64 and inter_dim % g2_bk == 0
+     g2_tile, g2_lay = make_g2_tile_runner(
+         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=True, INTER_MAX=inter_dim,
+         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
+         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
+         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
+-        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic",
++        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", pipelined=G2_PIPELINED,
+     )
+     g2_tile_cached, _ = make_g2_tile_runner(
+         BM=sort_block_m, BN=g2_bn, BK=g2_bk, SBM=sort_block_m, use_nt=False, INTER_MAX=inter_dim,
+         a_dtype="fp8", g2_bhoist=True, g2_ascale_pf=True, expert_offset=int(rank) * int(experts_per_rank),
+         npes=int(fuse_npes), topk=int(fuse_topk), N_OUT=model_dim, max_tok=int(fuse_mtpr),
+         recv_cap=int(g2_recv_cap), comb_inp_nbytes=int(fuse_mtpr) * int(fuse_topk) * model_dim * 2,
+-        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic",
++        clamp_a=True, store_cm=0, row_mask=True, p2p_quant_type="dynamic", pipelined=G2_PIPELINED,
+     )
+     # The combine input is in the uncached shmem heap: the reducers only need to drop their L1.
+     fused_combine_tail = make_fused_combine_tail(lds_fc_off=g2_lay["fc"], reducers=fused_reducers,
+@@ -1113,8 +1161,9 @@ def compile_mega_moe_stage1(
+         if owner:
+             emit_direct_fixed_slot_finalize(
+                 fz_npes=fz_npes, fz_epr=fz_epr, fz_cap=fz_cap, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
+-                fz_tile_m=fz_tile_m, addr_disp=addr_disp, parity=payload_parity,
++                fz_tile_m=fz_tile_m, fz_topk=fz_k - int(shared_slots), addr_disp=addr_disp, parity=payload_parity,
+                 expected=payload_expected, plan_nv=(_disp_ptr(DispatchSlot.PLAN_NV), gate_epoch),
++                fz_routed_epr=fz_routed_epr, cached_w_min_rows=cached_w_min_rows,
+             )
+         wave_id = fx.thread_idx.x // 64
+ 
+@@ -1185,6 +1234,13 @@ def compile_mega_moe_stage1(
+         g2_sweights = _disp_ptr(DispatchSlot.G2_SWEIGHTS)
+         g2_trb = _disp_ptr(DispatchSlot.G2_TRB)
+         g2_rows = _disp_ptr(DispatchSlot.TILE_ROWS)
++        if const_expr(G2_PIPELINED):
++            # The descriptors of the pipelined tile's loads must be uniform (SGPRs), not waterfall loops.
++            def _rfl(v):
++                return fx.Int64(rocdl.readfirstlane(T.i64, fx.Int64(v).ir_value()))
++            g2_aq, g2_ascale, g2_bq, g2_bscale = _rfl(g2_aq), _rfl(g2_ascale), _rfl(g2_bq), _rfl(g2_bscale)
++            g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows = (
++                _rfl(g2_eids), _rfl(g2_stids), _rfl(g2_sweights), _rfl(g2_trb), _rfl(g2_rows))
+         g2_max_m_blocks = fx.Int32(_disp_ptr(DispatchSlot.G2_MAX_M_BLOCKS))
+         g2_scratch = lds_typed_ptr(fx.Int32(g2_scratch_off), T.i32, align=4)
+ 
+@@ -1221,11 +1277,13 @@ def compile_mega_moe_stage1(
+         work_shard = fx.Int32(comm_ops.hw_xcc_id()) & fx.Int32(7)
+         # Equal slices of the unit space, so an m-tile count that is not a multiple of 8 does not leave one XCD a
+         # whole m-tile behind. GEMM2 of an m-tile reads its GEMM1 output from the L2 of the XCD that wrote it,
+-        # except in the m-tiles cut by a slice end (see _count_tile). Slice ends fall on groups of 4 n-tiles,
+-        # whose output scales fill whole 256-byte blocks: no cache line of GEMM1 output is written by two XCDs.
+-        assert N_TILES % 4 == 0
+-        shard_base = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-4)
+-        shard_work = (((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-4)) - shard_base
++        # except in the m-tiles cut by a slice end (see _count_tile). Slice ends fall on groups of 512 // tile_n
++        # n-tiles (256 output columns), whose output scales fill whole 256-byte blocks: no cache line of GEMM1 output
++        # is written by two XCDs.
++        n_group = 512 // tile_n
++        assert N_TILES % n_group == 0
++        shard_base = ((work_shard * total_work) // fx.Int32(8)) & fx.Int32(-n_group)
++        shard_work = (((work_shard + fx.Int32(1)) * total_work) // fx.Int32(8) & fx.Int32(-n_group)) - shard_base
+ 
+         # The m-tiles at this XCD slice's ends that the slice cuts (-1: the end is on an m-tile boundary).
+         shard_end = shard_base + shard_work
+@@ -1316,36 +1374,48 @@ def compile_mega_moe_stage1(
+         # A rank that receives many rows sends its GEMM2 rows as FP8: they halve the traffic it would otherwise
+         # spend most of its GEMM2 sending; the other ranks keep BF16 rows.
+         fp8_rows = (plan_low >> fx.Int32(_PLAN_FP8_ROWS_BIT)) & fx.Int32(1)
++        g2_par = fx.Int32(0)
+         while g2_active:
+             fx.barrier()
+-            if tid == fx.Int32(0):
+-                if g2_fetch != fx.Int32(0):
+-                    fx.ptr_store(fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1))) - shard_work,
+-                        g2_scratch)
+-            fx.barrier()
+-            g2_local = fx.Int32(fx.rocdl.readfirstlane(T.i32, fx.ptr_load(g2_scratch).ir_value()))
++            if const_expr(not G2_PIPELINED):
++                if tid == fx.Int32(0):
++                    if g2_fetch != fx.Int32(0):
++                        fx.ptr_store(fx.Int32(comm_ops.atomic_add_agent(g2_head, fx.Int32(1))) - shard_work,
++                            g2_scratch)
++                fx.barrier()
++            # Pipelined tiles claim the CTA's next unit themselves, into the other of two LDS words (the first unit
++            # comes from the GEMM1 loop, in the first word).
++            cur_slot = fx.Int32(g2_scratch_off) + g2_par * fx.Int32(8)
++            nxt_slot = fx.Int32(g2_scratch_off + 8) - g2_par * fx.Int32(8)
++            g2_local = fx.Int32(fx.rocdl.readfirstlane(
++                T.i32, fx.ptr_load(lds_typed_ptr(cur_slot, T.i32, align=4)).ir_value()))
+             if g2_local < g2_units:
+                 g2_u = g2_base + g2_local
+                 g2_m = g2_u // fx.Int32(g2_n_blocks)
+                 g2_n = g2_u - g2_m * fx.Int32(g2_n_blocks)
+-                if tid == fx.Int32(0):
+-                    comm_ops.wait_i32_until_equals(a_g2_ready + fx.Int64(g2_m) * fx.Int64(4), gate_epoch)
+-                fx.barrier()
+-                # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written back
+-                # to memory by the other XCD into lines this XCD has not cached, before it was counted: only the
+-                # CU's L1 can be stale.
+-                comm_ops.invalidate_l1()
++                g2_ready_addr = a_g2_ready + fx.Int64(g2_m) * fx.Int64(4)
++                if const_expr(not G2_PIPELINED):
++                    if tid == fx.Int32(0):
++                        comm_ops.wait_i32_until_equals(g2_ready_addr, gate_epoch)
++                    fx.barrier()
++                    # GEMM1 wrote this m-tile through this XCD's L2, or (in an m-tile shared by two XCDs) written
++                    # back to memory by the other XCD into lines this XCD has not cached, before it was counted:
++                    # only the CU's L1 can be stale.
++                    comm_ops.invalidate_l1()
+                 # As in GEMM1, a rank that receives many rows reads W2 through the cache.
+                 if cached_w != fx.Int32(0):
+                     g2_tile_cached(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq,
+                         g2_bscale, g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks,
+-                        fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows)
++                        fx.Int32(inter_dim), fx.Int32(model_dim), fp8_rows, g2_ready_addr, gate_epoch, g2_head,
++                        shard_work, nxt_slot)
+                 else:
+                     g2_tile(lds_base_i32, tid, g2_lane, g2_wave, g2_m, g2_n, g2_aq, g2_ascale, g2_bq, g2_bscale,
+                         g2_eids, g2_stids, g2_sweights, g2_trb, g2_rows, g2_max_m_blocks, fx.Int32(inter_dim),
+-                        fx.Int32(model_dim), fp8_rows)
++                        fx.Int32(model_dim), fp8_rows, g2_ready_addr, gate_epoch, g2_head, shard_work, nxt_slot)
+             g2_active = g2_local < g2_units
+             g2_fetch = fx.Int32(1)
++            if const_expr(G2_PIPELINED):
++                g2_par = fx.Int32(1) - g2_par
+         # The entry-ticket epoch is the same on every rank and needs no load; the high bit keeps it apart from
+         # the combine op's own flag values in the shared xdb slots.
+         fc_flag = fx.Int64(gate_epoch) + fx.Int64(1 << 40)
+@@ -1381,7 +1451,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
+     sort_block_m=32, tile_n=256, tile_k=256, num_waves=4, grid_mult=4, pipe_weights=True,
+     mfma_amajor=False, swizzle_a=True, async_a_copy=False, num_dispatch_cu=32,
+     use_tile_resource=True, waves_per_eu_hint=2,
+-    b_nt=-1, swiglu_limit=0.0, preload=False):
++    b_nt=-1, swiglu_limit=0.0, shared_slots=0, preload=False):
+     launch = compile_mega_moe_stage1(
+         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
+         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
+@@ -1390,7 +1460,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
+         grid_mult=grid_mult, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, swizzle_a=swizzle_a,
+         async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
+         waves_per_eu_hint=waves_per_eu_hint, num_cu=num_cu, num_dispatch_cu=num_dispatch_cu,
+-        b_nt=b_nt, swiglu_limit=swiglu_limit,
++        b_nt=b_nt, swiglu_limit=swiglu_limit, shared_slots=shared_slots,
+     )
+     # preload: compile and load without dispatching (AOT bundles).
+     (_preload_compiled if preload else _run_compiled)(
+@@ -1405,15 +1475,24 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
+ _COMBINE_REDUCERS = 256
+ # Token bucket from which the expert m-tile is 64 rows instead of 32.
+ _BM64_MIN_BUCKET = 256
+-# Routed rows a rank receives (before tile padding) from which the streaming GEMM1 / GEMM2 bodies give way to
+-# cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
+-# cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688).
++# Received rows of a 48-routed-expert rank (before tile padding) from which the streaming GEMM1 / GEMM2 bodies give
++# way to cached-weight ones, whose experts then span enough m-tiles to reuse their weights. Measured: cached loads
++# cost uniform routing at 384 tokens (2304 rows) and gain from 448 (2688). The threshold is per routed expert
++# (~53 rows): it scales with the routed experts of the rank (853 rows for the 16 of the DSpark draft MoE, whose
++# uniform 384 / 512-token calls gain 5 / 11 us from cached weights; 300 tokens is within noise).
+ _CACHED_W_MIN_ROWS = 2560
+-# Routed rows a rank receives from which its GEMM2 sends FP8 rows (1x32 E8M0 scales, the numerics of the main
+-# path) to the combine instead of BF16: above the 3072 rows of uniform routing at 512 tokens.
+-_FP8_ROWS_MIN_ROWS = 3584
+-# Rows of a rank's largest expert from which the rank also takes both of the above: its rows sit in a few experts
+-# (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
++_CACHED_W_REF_EXPERTS = 48
++
++
++# Routed rows a rank receives (fused shared slots excluded) from which its GEMM2 sends FP8 rows (1x32 E8M0 scales,
++# the numerics of the main path) to the combine instead of BF16: 512 rows above uniform routing at 512 tokens
++# (3584 at routed top-6, 4608 at top-8), so uniform calls always combine BF16 rows.
++def _fp8_rows_min_rows(topk: int) -> int:
++    return 512 * (int(topk) + 1)
++
++
++# Rows of a rank's largest routed expert from which the rank also takes both of the above: its rows sit in a few
++# experts (skewed routing), far above the 64-row average of uniform routing at 512 tokens.
+ _HOT_EXPERT_MIN_ROWS = 256
+ # Bits of the plan word's low half that carry the two decisions above (num_valid < 2^29).
+ _PLAN_CACHED_W_BIT = 29
+@@ -1439,14 +1518,23 @@ def small_m_config(
+                 config.stage2, block_n=256, persist=False, persist_cu=0, use_nt=True
+             ),
+         )
++    if (2 * inter_dim // config.stage1.tile_n) % 4:
++        # The tile_n 256 of buckets <= 8 gives V4.1-Flash (inter_dim 2304) 18 n-tiles; the 32-row path keeps 128
++        # (36 n-tiles), as every other 32-row bucket uses.
++        config = replace(config, stage1=replace(config.stage1, tile_n=128))
+     if nearest_token_bucket(max(tokens, 1)) >= _BM64_MIN_BUCKET:
+         # 64-row expert tiles: at ~35+ rows per expert a 32-row tile splits every expert in two and streams its
+         # weights twice.
+         config = replace(
+             config,
+-            stage1=replace(config.stage1, sort_block_m=64),
++            # 256-column GEMM1 units: half the A re-reads and half the per-unit fixed cost of 128 columns, and the
++            # GEMM1 output of an m-tile is done in 18 instead of 36 units (real decode routing 372 -> 350 us
++            # together with the pipelined GEMM2 tile).
++            stage1=replace(config.stage1, sort_block_m=64, tile_n=256),
+             stage2=replace(config.stage2, block_m=64),
+         )
++    # The XCD split needs whole groups of 256 output columns (512 // tile_n GEMM1 n-tiles).
++    assert (2 * inter_dim // config.stage1.tile_n) % (512 // config.stage1.tile_n) == 0, config.stage1.tile_n
+     return config
+ 
+ 
+@@ -1460,7 +1548,7 @@ class SmallMRuntime:
+     # fmt: off
+     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
+         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
+-        max_tok_per_rank: int, swiglu_limit: float = 0.0):
++        max_tok_per_rank: int, swiglu_limit: float = 0.0, shared_experts: int = 0):
+     # fmt: on
+         if quant != "a8w4":
+             raise ValueError("SmallMRuntime currently supports quant='a8w4' only")
+@@ -1478,6 +1566,12 @@ class SmallMRuntime:
+         self.epr = int(experts // world_size)
+         self.topk = int(topk)
+         self.mtpr = int(max_tok_per_rank)
++        # The last shared_experts local slots of every rank hold fused shared experts (vLLM's fuse_shared_expert:
++        # every token adds a weight-1 route to its own rank's slot). They hold every local token, so the plan keeps
++        # them out of the hot-expert test and the FP8-row decision.
++        if not 0 <= shared_experts < self.epr:
++            raise ValueError(f"shared_experts={shared_experts} must leave routed experts (experts/rank {self.epr})")
++        self.shared_slots = int(shared_experts)
+         self.swiglu_limit = float(swiglu_limit)
+         if self.swiglu_limit < 0:
+             raise ValueError("swiglu_limit must be non-negative")
+@@ -1485,14 +1579,14 @@ class SmallMRuntime:
+         from .mega_moe_v2 import small_m_eligible
+ 
+         # Built directly, the runtime checks the layout MegaMoEV2 gates it to (the kernel splits its
+-        # work over 8 XCDs and bakes in the EP8 DeepSeek-V4 shape), instead of failing at compile.
++        # work over 8 XCDs and bakes in the EP8 / 48-experts-per-rank layout), instead of failing at compile.
+         if not small_m_eligible(
+             enabled=True, arch=get_gfx_runtime(),
+             num_cu=torch.cuda.get_device_properties(self.dev).multi_processor_count,
+             world_size=self.world_size, model_dim=self.model_dim, inter_dim=self.inter_dim,
+             experts=self.experts, topk=self.topk, quant=quant, swiglu_limit=self.swiglu_limit,
+         ):
+-            raise ValueError("SmallMRuntime supports the EP8 DeepSeek-V4 a8w4 layout on 8-XCD gfx950 only")
++            raise ValueError("SmallMRuntime supports the EP8 a8w4 SMALL_M_SHAPES layouts on 8-XCD gfx950 only")
+         # The combine reducers run at the end of the kernel on a fully resident grid, so they are not bounded by
+         # one XCD's residency.
+         self._reducers = _COMBINE_REDUCERS
+@@ -1678,7 +1772,8 @@ class SmallMRuntime:
+             mfma_amajor=stage1.mfma_amajor, swizzle_a=stage1.swizzle_a,
+             async_a_copy=stage1.async_a_copy, num_dispatch_cu=stage1.num_dispatch_cu,
+             use_tile_resource=stage1.use_tile_resource,
+-            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit, preload=preload)
++            waves_per_eu_hint=stage1.waves_per_eu_hint, b_nt=stage1.b_nt, swiglu_limit=self.swiglu_limit,
++            shared_slots=self.shared_slots, preload=preload)
+         # fmt: on
+ 
+     def preload_aot_bundle(self):
+diff --git a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
+index 419f5e8ba..97aec1000 100644
+--- a/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
++++ b/aiter/ops/flydsl/kernels/mega_moe/mega_moe_v2.py
+@@ -19,6 +19,8 @@ from ..flydsl_dispatch_combine_intranode_op import (
+ from . import envs
+ from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
+ from .mega_moe_config import (
++    SMALL_M_SHAPES,
++    large_m_shape_supported,
+     INDEXED_PAYLOAD_MIN_MTPR,
+     MegaMoEConfig,
+     Stage1Config,
+@@ -58,19 +60,15 @@ def large_m_eligible(
+     fanout_masks: tuple[int, ...] = (),
+     act: str = "silu",
+ ) -> bool:
+-    """Whether the large-input path supports this layout (EP8 DeepSeek-V4 a8w4)."""
++    """Whether the large-input path supports this layout (EP8 a8w4, LARGE_M_MTPR_SHAPES)."""
+     return (
+         enabled
+         and arch.split(":", 1)[0] == "gfx950"
+         and world_size == 8
+-        and model_dim == 7168
+-        and inter_dim == 3072
+-        and experts == 384
+-        and experts // world_size == 48
+-        and topk == 6
++        and large_m_shape_supported(
++            max_tok_per_rank, model_dim, inter_dim, experts, topk, swiglu_limit
++        )
+         and quant == "a8w4"
+-        and max_tok_per_rank == 8192
+-        and swiglu_limit == 10.0
+         and act == "silu"
+         and not fanout_masks
+     )
+@@ -91,22 +89,31 @@ def small_m_eligible(
+     fanout_masks: tuple[int, ...] = (),
+     act: str = "silu",
+ ) -> bool:
+-    """Whether the small-input path supports this layout (EP8 DeepSeek-V4 a8w4).
++    """Whether the small-input path supports this layout (EP8 a8w4, SMALL_M_SHAPES).
+ 
+     The kernel splits its work across 8 XCDs by XCC id, so it needs the 8-XCD
+     (256-CU) gfx950 parts; a 4-XCD part would leave half the work unclaimed.
++    Besides SMALL_M_SHAPES, the V4 / V4.1-Flash dims (7168 / 3072, 5120 / 2304) with SwiGLU clamp 10 take any
++    1..64 experts per rank (one plan lane per local expert) and top-1..8: vLLM's fuse_shared_expert layout of the
++    routed MoE (392 / top-7) and the DSpark draft MoE (128 / top-3) were checked against an FP32 reference and the
++    main path on 8x MI355X.
+     """
+     return (
+         enabled
+         and arch.split(":", 1)[0] == "gfx950"
+         and num_cu == 256
+         and world_size == 8
+-        and model_dim == 7168
+-        and inter_dim == 3072
+-        and experts == 384
+-        and topk == 6
++        and (
++            (model_dim, inter_dim, experts, topk, float(swiglu_limit)) in SMALL_M_SHAPES
++            or (
++                (model_dim, inter_dim) in ((7168, 3072), (5120, 2304))
++                and float(swiglu_limit) == 10.0
++                and experts % world_size == 0
++                and 1 <= experts // world_size <= 64
++                and 1 <= topk <= 8
++            )
++        )
+         and quant == "a8w4"
+-        and swiglu_limit == 10.0
+         and act == "silu"
+         and not fanout_masks
+     )

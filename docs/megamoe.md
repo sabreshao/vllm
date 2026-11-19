@@ -59,7 +59,7 @@ aiter/ops/flydsl/kernels/mega_moe_gfx1250/
 
 ### Pro 专属：small_m / large_m（更少 kernel）
 
-仅 **DeepSeek-V4-Pro 形状**：`H=7168, I=3072, E=384, topk=6, EP8, a8w4, silu, swiglu_limit=10`，且无 `fanout_masks`。Flash（5120×2304）在 aiter 0.1.29 原版里**进不了** small_m。依次打上 [patches/](./patches/) 里的 `0001`～`0003` 三个补丁后：Flash 可用；每卡专家数放宽到 1～64、topk 放宽到 1～8，草稿 MoE 和融合共享专家的布局都能用；GEMM 也做了优化。vLLM 接线和实测见 [megamoe_single_kernel_dsv41f.md](./megamoe_single_kernel_dsv41f.md)。
+仅 **DeepSeek-V4-Pro 形状**：`H=7168, I=3072, E=384, topk=6, EP8, a8w4, silu, swiglu_limit=10`，且无 `fanout_masks`。Flash（5120×2304）在 aiter 0.1.29 原版里**进不了** small_m。打上 [patches/aiter-0.1.29-mega_moe-dsv41-flash.patch](./patches/aiter-0.1.29-mega_moe-dsv41-flash.patch)（含原 `0001`～`0003`）后：Flash 可用；每卡专家数放宽到 1～64、topk 放宽到 1～8，草稿 MoE 和融合共享专家的布局都能用；GEMM 也做了优化。vLLM 接线和实测见 [megamoe_single_kernel_dsv41f.md](./megamoe_single_kernel_dsv41f.md)。
 
 | 路径 | 开关 | 条件补充 | Kernel 数 |
 |---|---|---|---|
@@ -146,11 +146,11 @@ gfx950 MegaMoE **不都是四个 kernel**。Flash / R1 / Kimi-K3 / 多数 Pro �
 
 ## DeepSeek-V4.1-Flash：decode 走 AITER 单 kernel MegaMoE（small_m）
 
-### 依赖：AITER 0.1.29 加三个补丁
+### 依赖：AITER 0.1.29 加一个补丁
 
-按顺序打 [`patches/`](./patches/) 下的三个补丁，基线是 amd-aiter 0.1.29，补丁都只改 `aiter/ops/flydsl/kernels/mega_moe/` 下的文件：
+打 [`patches/aiter-0.1.29-mega_moe-dsv41-flash.patch`](./patches/aiter-0.1.29-mega_moe-dsv41-flash.patch)（一个补丁，基线 amd-aiter 0.1.29，只改 `aiter/` 下的文件，补丁头列出了所含 commit）。它包含原先分开提供的三个补丁（下表，`0001` 由 V4.1-Flash 形状 commit 等价覆盖），另含 prefill large_m 所需的改动（见 [megamoe_large_m_dsv41f.md](./megamoe_large_m_dsv41f.md)）：
 
-| 补丁 | 内容 | 不打时 |
+| 原补丁 | 内容 | 没有这部分时 |
 |---|---|---|
 | `0001-...-dsv41-flash.patch` | `small_m_eligible` 允许 5120 / 2304；每卡 ≤ 8 token 的档位在 V4.1 上会触发 `assert N_TILES % 4 == 0`，改为退回 `tile_n=128` | V4.1 不走单 kernel |
 | `0002-...-any-experts-shared-slot.patch` | 每卡专家数从只允许 48 个放宽到 1～64 个，topk 放宽到 1～8，所以草稿 MoE（128 个专家、top-3）和融合共享专家后的布局（392 个专家、top-7）都能走单 kernel；新增 `SmallMRuntime(shared_experts=N)`，共享专家槽不参与热点专家和 FP8 combine 行的判断 | 草稿 MoE 和融合配置仍走多段 kernel |
@@ -229,7 +229,7 @@ gfx950 MegaMoE **不都是四个 kernel**。Flash / R1 / Kimi-K3 / 多数 Pro �
 
 ### 启动命令
 
-镜像要求：包含本 PR 的 vLLM，AITER 0.1.29 并打上 `0001`～`0003`。
+镜像要求：包含本 PR 的 vLLM，AITER 0.1.29 并打上 `patches/aiter-0.1.29-mega_moe-dsv41-flash.patch`。
 
 ```bash
 docker run -d --name dsv41f --network host --ipc host --shm-size 64g \
